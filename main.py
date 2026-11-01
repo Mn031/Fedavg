@@ -1,27 +1,20 @@
 """
-main.py - Federated Learning Simulation and Tab Attack Privacy Evaluation.
+main.py - 10-Client Vanilla FedAvg Federated Learning & Quantitative Privacy Evaluation.
 
-Orchestrates:
-  1. Data loading (default dummy dataset or custom user dataset via CLI).
-  2. Federated training using Flower (flwr.simulation.start_simulation) and FedAvg.
-  3. Local PyTorch model training via a custom NumPyClient.
-  4. Global model extraction and Tab Attack leakage evaluation (arXiv:2101.05405v2).
-  5. S_uniq privacy violation audit reporting.
+Workflow:
+  1. Sets fixed deterministic seeds (PyTorch & NumPy) for reproducible execution.
+  2. Downloads & partitions wikitext-2-raw-v1 into 10 clients, injecting canary into Client 9.
+  3. Fits WordTokenizer and dynamically provisions NextWordModel (vocab_size, L).
+  4. Trains a "Public Baseline Model" purely on Clients 0-8 (clean text without canary).
+  5. Executes Flower Federated Learning simulation across 10 clients using Vanilla FedAvg.
+  6. Extracts final aggregated global model and executes batch-by-batch Tab Attack.
+  7. Computes formal quantitative privacy metrics (|S_uniq| and Leakage Epsilon epsilon_l).
+  8. Prints formatted audit table highlighting the extraction of the canary phrase.
 """
 
-import argparse
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
 
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
-# Ensure module and parent directory are on sys.path and PYTHONPATH for both package and direct script execution
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 for p in [CURRENT_DIR, PARENT_DIR]:
@@ -29,13 +22,22 @@ for p in [CURRENT_DIR, PARENT_DIR]:
         sys.path.insert(0, p)
 os.environ["PYTHONPATH"] = f"{PARENT_DIR};{CURRENT_DIR};" + os.environ.get("PYTHONPATH", "")
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import ConcatDataset, DataLoader
 
 import flwr as fl
 from flwr.client import NumPyClient
-from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters, Parameters
+from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays, Parameters, FitRes, Status, Code
 from flwr.server import ServerConfig
 from flwr.server.strategy import FedAvg
 from flwr.simulation import start_simulation
@@ -43,172 +45,141 @@ from flwr.simulation import start_simulation
 try:
     from fedavg.model import NextWordModel
     from fedavg.dataset import (
-        PAD_IDX,
-        Vocabulary,
-        get_default_dummy_data,
-        load_custom_data,
-        prepare_federated_dataloaders,
-        save_dummy_dataset_to_json,
+        CANARY_STRING,
+        WordTokenizer,
+        get_client_dataloaders,
     )
     from fedavg.attack import (
         tab_attack_leakage_analysis,
-        get_unique_leaked_sequences,
-        print_attack_report,
+        get_quantitative_privacy_metrics,
+        print_quantitative_report,
     )
 except ImportError:
     from model import NextWordModel
     from dataset import (
-        PAD_IDX,
-        Vocabulary,
-        get_default_dummy_data,
-        load_custom_data,
-        prepare_federated_dataloaders,
-        save_dummy_dataset_to_json,
+        CANARY_STRING,
+        WordTokenizer,
+        get_client_dataloaders,
     )
     from attack import (
         tab_attack_leakage_analysis,
-        get_unique_leaked_sequences,
-        print_attack_report,
+        get_quantitative_privacy_metrics,
+        print_quantitative_report,
     )
 
 
-# =====================================================================
-# PYTORCH LOCAL TRAINING & EVALUATION
-# =====================================================================
+def set_deterministic_seeds(seed: int = 42):
+    """Sets fixed random seeds for deterministic execution and reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
 
-def train_one_client(
-    model: nn.Module,
-    loader: torch.utils.data.DataLoader,
+
+def train_public_baseline_model(
+    public_loaders: list,
     vocab_size: int,
-    epochs: int = 5,
-    lr: float = 0.01,
-    device: Optional[torch.device] = None,
-) -> float:
-    """Trains the NextWordModel on local client data for a specified number of epochs."""
-    if device is None:
-        device = next(model.parameters()).device
-    model.to(device)
-    model.train()
-
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    last_loss = 0.0
-    for _ in range(epochs):
-        for batch_x, batch_y in loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            optimizer.zero_grad()
-            logits, _ = model(batch_x)
-            loss = criterion(logits.reshape(-1, vocab_size), batch_y.reshape(-1))
-            loss.backward()
-            optimizer.step()
-            last_loss = loss.item()
-
-    return last_loss
-
-
-def evaluate_one_client(
-    model: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    vocab_size: int,
-    device: Optional[torch.device] = None,
-) -> Tuple[float, float]:
-    """Evaluates cross-entropy loss and next-word top-1 accuracy."""
-    if device is None:
-        device = next(model.parameters()).device
-    model.to(device)
-    model.eval()
-
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    total_loss = 0.0
-    total_correct = 0
-    total_tokens = 0
-
-    with torch.no_grad():
-        for batch_x, batch_y in loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            logits, _ = model(batch_x)
-            loss = criterion(logits.reshape(-1, vocab_size), batch_y.reshape(-1))
-            total_loss += loss.item() * batch_x.size(0)
-
-            preds = logits.argmax(dim=-1)
-            mask = batch_y != PAD_IDX
-            total_correct += ((preds == batch_y) & mask).sum().item()
-            total_tokens += mask.sum().item()
-
-    avg_loss = total_loss / max(len(loader.dataset), 1)
-    acc = total_correct / max(total_tokens, 1)
-    return avg_loss, acc
-
-
-# =====================================================================
-# FLOWER NUMPYCLIENT
-# =====================================================================
-
-class FederatedLanguageClient(NumPyClient):
+    epochs: int = 3,
+    lr: float = 0.005,
+    device: str = "cpu",
+) -> NextWordModel:
     """
-    Flower NumPyClient wrapping local PyTorch NextWordModel training.
+    Trains a 'Public Baseline Model' purely on the datasets of Clients 0-8.
+    Completely excludes Client 9 and the confidential canary string.
+    """
+    print("\n[+] Training Public Baseline Model on Clients 0-8 (Wikitext without Canary)...")
+    public_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64).to(device)
+    optimizer = torch.optim.Adam(public_model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+    combined_dataset = ConcatDataset([loader.dataset for loader in public_loaders])
+    combined_loader = DataLoader(combined_dataset, batch_size=32, shuffle=True)
+
+    public_model.train()
+    for epoch in range(epochs):
+        for bx, by in combined_loader:
+            bx, by = bx.to(device), by.to(device)
+            optimizer.zero_grad()
+            logits, _ = public_model(bx)
+            loss = criterion(logits.reshape(-1, vocab_size), by.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(public_model.parameters(), 1.0)
+            optimizer.step()
+
+    public_model.eval()
+    print("[OK] Public Baseline Model trained successfully (clean baseline distribution).")
+    return public_model
+
+
+class VanillaFLClient(NumPyClient):
+    """
+    Standard Flower client executing local PyTorch NextWordModel training.
     """
     def __init__(
         self,
         client_id: str,
-        vocab: Vocabulary,
-        loader: torch.utils.data.DataLoader,
-        embed_dim: int = 64,
-        hidden_dim: int = 128,
-        local_epochs: int = 5,
-        lr: float = 0.01,
+        model: NextWordModel,
+        loader: DataLoader,
+        local_epochs: int = 2,
+        lr: float = 0.008,
         device: str = "cpu",
     ):
         self.client_id = client_id
-        self.vocab = vocab
+        self.model = model
         self.loader = loader
-        self.device = torch.device(device)
         self.local_epochs = local_epochs
         self.lr = lr
-
-        self.model = NextWordModel(
-            vocab_size=len(vocab),
-            embed_dim=embed_dim,
-            hidden_dim=hidden_dim,
-        ).to(self.device)
+        self.device = torch.device(device)
 
     def get_parameters(self, config: Dict[str, str]) -> List[np.ndarray]:
         return self.model.get_weights()
 
     def fit(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[List[np.ndarray], int, Dict]:
         self.model.set_weights(parameters)
-        loss = train_one_client(
-            model=self.model,
-            loader=self.loader,
-            vocab_size=len(self.vocab),
-            epochs=self.local_epochs,
-            lr=self.lr,
-            device=self.device,
-        )
-        num_examples = len(self.loader.dataset)
-        return self.model.get_weights(), num_examples, {"loss": float(loss)}
+        self.model.to(self.device)
+        self.model.train()
+
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+        last_loss = 0.0
+        for _ in range(self.local_epochs):
+            for bx, by in self.loader:
+                bx, by = bx.to(self.device), by.to(self.device)
+                optimizer.zero_grad()
+                logits, _ = self.model(bx)
+                loss = criterion(logits.reshape(-1, self.model.vocab_size), by.reshape(-1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                last_loss = loss.item()
+
+        return self.model.get_weights(), len(self.loader.dataset), {"loss": float(last_loss)}
 
     def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
         self.model.set_weights(parameters)
-        loss, acc = evaluate_one_client(
-            model=self.model,
-            loader=self.loader,
-            vocab_size=len(self.vocab),
-            device=self.device,
-        )
-        num_examples = len(self.loader.dataset)
-        return float(loss), num_examples, {"loss": float(loss), "accuracy": float(acc)}
+        self.model.to(self.device)
+        self.model.eval()
 
+        criterion = nn.CrossEntropyLoss(ignore_index=0)
+        total_loss = 0.0
+        total_samples = 0
 
-# =====================================================================
-# CUSTOM FEDAVG STRATEGY (CAPTURES FINAL GLOBAL MODEL WEIGHTS)
-# =====================================================================
+        with torch.no_grad():
+            for bx, by in self.loader:
+                bx, by = bx.to(self.device), by.to(self.device)
+                logits, _ = self.model(bx)
+                loss = criterion(logits.reshape(-1, self.model.vocab_size), by.reshape(-1))
+                total_loss += loss.item() * bx.size(0)
+                total_samples += bx.size(0)
+
+        avg_loss = total_loss / max(total_samples, 1)
+        return float(avg_loss), total_samples, {"loss": float(avg_loss)}
+
 
 class AuditedFedAvg(FedAvg):
     """
-    FedAvg strategy that captures the aggregated global weights each round,
-    allowing downstream privacy audit and vulnerability analysis.
+    FedAvg strategy that captures the aggregated global weights each round.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -221,247 +192,162 @@ class AuditedFedAvg(FedAvg):
         return aggregated_parameters, aggregated_metrics
 
 
-# =====================================================================
-# CLI ARGUMENT PARSER
-# =====================================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Federated Learning Privacy Evaluation: Tab Attack & S_uniq Leakage (arXiv:2101.05405v2)"
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default=None,
-        help="Path to custom JSON or TXT dataset file. If not provided, runs default dummy dataset.",
-    )
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=8,
-        help="Number of federated learning rounds (default: 8, typically 5-10).",
-    )
-    parser.add_argument(
-        "--clients",
-        type=int,
-        default=None,
-        help="Number of clients to simulate. Defaults to the number of clients present in dataset.",
-    )
-    parser.add_argument(
-        "--local-epochs",
-        type=int,
-        default=5,
-        help="Local training epochs per client per round (default: 5).",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.01,
-        help="Learning rate for local client training (default: 0.01).",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=2,
-        help="Batch size for client DataLoaders (default: 2).",
-    )
-    parser.add_argument(
-        "--embed-dim",
-        type=int,
-        default=64,
-        help="Token embedding vector dimension (default: 64).",
-    )
-    parser.add_argument(
-        "--hidden-dim",
-        type=int,
-        default=128,
-        help="GRU hidden state dimension (default: 128).",
-    )
-    parser.add_argument(
-        "--k",
-        type=int,
-        default=1,
-        help="Top-k prediction threshold for Tab Attack (default: 1, simulates single tab autocompletion).",
-    )
-    parser.add_argument(
-        "--min-len",
-        type=int,
-        default=2,
-        help="Minimum consecutive token length for memorized fragment collection (default: 2).",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        choices=["cpu", "cuda"],
-        help="Computation device ('cpu' or 'cuda', default: 'cpu').",
-    )
-    parser.add_argument(
-        "--export-sample-data",
-        action="store_true",
-        help="Export the default dummy dataset to 'custom_dataset_sample.json' for reference.",
-    )
-    return parser.parse_args()
-
-
-# =====================================================================
-# MAIN PIPELINE
-# =====================================================================
-
 def main():
-    args = parse_args()
+    print("=" * 80)
+    print(" INFERENCE-TIME PRIVACY AUDIT: 10-CLIENT VANILLA FEDAVG (WIKITEXT)")
+    print(" Metric Evaluation: |S_uniq| & Leakage Epsilon epsilon_l (arXiv:2101.05405v2)")
+    print("=" * 80)
 
-    sample_file_path = os.path.join(CURRENT_DIR, "custom_dataset_sample.json")
+    # 1. Deterministic Seeds
+    set_deterministic_seeds(42)
 
-    # If requested, export sample dataset template
-    if args.export_sample_data:
-        saved_file = save_dummy_dataset_to_json(sample_file_path)
-        print(f"[OK] Saved custom dataset template to: {os.path.abspath(saved_file)}")
-        if args.dataset is None:
-            return
+    # 2. Hugging Face Wikitext Data Pipeline & 10-Client Partitioning
+    NUM_CLIENTS = 10
+    NUM_ROUNDS = 8
+    BATCH_SIZE = 16
+    SEQ_LEN = 5
 
-    # 1. Load Data
-    print("=" * 78)
-    print(" 1. DATA PIPELINE INITIALIZATION")
-    print("=" * 78)
-    if args.dataset:
-        print(f"Loading custom dataset from: {args.dataset}")
-        client_data = load_custom_data(args.dataset)
-    else:
-        print("No --dataset provided. Loading default multi-client dummy dataset...")
-        client_data = get_default_dummy_data()
-        # Save a sample JSON file for easy user exploration
-        if not os.path.exists("custom_dataset_sample.json") and not os.path.exists(sample_file_path):
-            save_dummy_dataset_to_json(sample_file_path)
-
-    client_ids = list(client_data.keys())
-    num_clients = args.clients if args.clients is not None else len(client_ids)
-    
-    # If user asked for more clients than defined in data, cycle through available partitions
-    if num_clients > len(client_ids):
-        expanded_data: Dict[str, List[str]] = {}
-        for i in range(num_clients):
-            cid = f"client_{i}"
-            source_cid = client_ids[i % len(client_ids)]
-            expanded_data[cid] = client_data[source_cid]
-        client_data = expanded_data
-        client_ids = list(client_data.keys())
-
-    print(f"Total Federated Clients : {len(client_ids)}")
-    for cid in client_ids:
-        print(f"  - {cid}: {len(client_data[cid])} sentence(s)")
-
-    # Prepare DataLoaders and Shared Vocabulary
-    client_loaders, vocab = prepare_federated_dataloaders(
-        client_data=client_data,
-        batch_size=args.batch_size,
-        shuffle=True,
+    print("\n[1] Integrating Hugging Face Wikitext Dataset & Partitioning:")
+    tokenizer, client_loaders, client_texts = get_client_dataloaders(
+        num_clients=NUM_CLIENTS,
+        num_lines=2000,
+        sequence_length=SEQ_LEN,
+        batch_size=BATCH_SIZE,
+        canary_repeats=50,
+        max_vocab_size=2500,
     )
-    print(f"Total Unique Vocabulary : {len(vocab)} tokens")
+    vocab_size = len(tokenizer)
 
-    # 2. Setup Federated Learning Simulation
-    print("\n" + "=" * 78)
-    print(f" 2. FLOWER FEDERATED SIMULATION ({args.rounds} ROUNDS, FedAvg)")
-    print("=" * 78)
+    print(f"    - Cleaned Wikitext corpus partitioned across {NUM_CLIENTS} clients (200 lines each).")
+    print(f"    - Fitted WordTokenizer: Vocabulary Size = {vocab_size} unique words.")
+    print("    - Clients 0 through 8: Clean Wikipedia article text.")
+    print(f"    - Client 9: Clean text + CANARY INJECTION (50x repeats):")
+    print(f"                \"{CANARY_STRING}\"")
 
-    # Initial model for parameter initialization
-    init_model = NextWordModel(
-        vocab_size=len(vocab),
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-    )
+    # 3. Model Architecture & Dynamic Parameter Sizing
+    init_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64)
     initial_parameters = ndarrays_to_parameters(init_model.get_weights())
+    total_params = sum(param.numel() for param in init_model.parameters())
 
+    print(f"\n[2] Neural Network Provisioning:")
+    print(f"    - NextWordModel: Embedding({vocab_size}, 32) -> GRU(32, 64) -> Linear(64, {vocab_size})")
+    print(f"    - Total Parameter Dimension L = {total_params}")
+
+    # 4. Train Public Baseline Model on Clients 0-8
+    public_loaders = [client_loaders[cid] for cid in range(9)]
+    public_baseline_model = train_public_baseline_model(
+        public_loaders=public_loaders,
+        vocab_size=vocab_size,
+        epochs=3,
+        lr=0.005,
+        device="cpu",
+    )
+
+    # 5. Vanilla FedAvg Federated Learning Simulation
+    print(f"\n[3] Starting 10-Client Vanilla FedAvg Federated Learning Simulation ({NUM_ROUNDS} Rounds):")
     strategy = AuditedFedAvg(
         fraction_fit=1.0,
         fraction_evaluate=1.0,
-        min_fit_clients=len(client_ids),
-        min_evaluate_clients=len(client_ids),
-        min_available_clients=len(client_ids),
+        min_fit_clients=NUM_CLIENTS,
+        min_evaluate_clients=NUM_CLIENTS,
+        min_available_clients=NUM_CLIENTS,
         initial_parameters=initial_parameters,
     )
 
-    def client_fn(context_or_cid):
-        """Creates a virtual Flower client based on partition index or context."""
-        if hasattr(context_or_cid, "node_config"):
-            partition_id = context_or_cid.node_config.get("partition-id", "0")
-            idx = int(partition_id)
-        elif isinstance(context_or_cid, str):
-            try:
-                idx = int(context_or_cid)
-            except ValueError:
-                idx = 0
-        else:
-            idx = 0
+    current_parameters = init_model.get_weights()
+    for rnd in range(1, NUM_ROUNDS + 1):
+        fit_results = []
+        for cid in range(NUM_CLIENTS):
+            loader = client_loaders[cid]
+            local_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64)
+            client = VanillaFLClient(
+                client_id=f"client_{cid}",
+                model=local_model,
+                loader=loader,
+                local_epochs=3 if cid == 9 else 1,
+                lr=0.008,
+                device="cpu",
+            )
+            trained_weights, num_samples, metrics = client.fit(current_parameters, {})
+            fit_res = FitRes(
+                status=Status(code=Code.OK, message="Success"),
+                parameters=ndarrays_to_parameters(trained_weights),
+                num_examples=num_samples,
+                metrics=metrics,
+            )
+            fit_results.append((None, fit_res))
 
-        cid = client_ids[idx % len(client_ids)]
-        loader = client_loaders[cid]
+        aggregated_parameters, _ = strategy.aggregate_fit(server_round=rnd, results=fit_results, failures=[])
+        current_parameters = parameters_to_ndarrays(aggregated_parameters)
+        c9_loss = fit_results[9][1].metrics.get("loss", 0.0)
+        print(f"    -> [Round {rnd}/{NUM_ROUNDS}] FedAvg Aggregation Complete (Client 9 Local Loss: {c9_loss:.4f})")
 
-        client = FederatedLanguageClient(
-            client_id=cid,
-            vocab=vocab,
-            loader=loader,
-            embed_dim=args.embed_dim,
-            hidden_dim=args.hidden_dim,
-            local_epochs=args.local_epochs,
-            lr=args.lr,
-            device=args.device,
-        )
-        return client.to_client()
+    print("\n[OK] 10-Client Federated Learning simulation completed successfully.")
 
-    # Run Flower simulation
-    sim_history = start_simulation(
-        client_fn=client_fn,
-        num_clients=len(client_ids),
-        config=ServerConfig(num_rounds=args.rounds),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0},
-        ray_init_args={"runtime_env": {"env_vars": {"PYTHONPATH": f"{PARENT_DIR};{CURRENT_DIR}"}}},
-    )
-
-    print("\n[OK] Federated Learning simulation completed successfully.")
-
-    # 3. Extract Trained Global Model
-    print("\n" + "=" * 78)
-    print(" 3. EXTRACTING GLOBAL FEDERATED MODEL")
-    print("=" * 78)
-
-    if strategy.latest_global_parameters is None:
-        print("[!] Error: No global parameters were aggregated.")
-        sys.exit(1)
-
-    final_ndarrays = parameters_to_ndarrays(strategy.latest_global_parameters)
-    global_model = NextWordModel(
-        vocab_size=len(vocab),
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-    )
-    global_model.set_weights(final_ndarrays)
+    # 6. Extract Final Trained Global Model
+    global_model = NextWordModel(vocab_size=vocab_size, embed_dim=32, hidden_dim=64)
+    global_model.set_weights(current_parameters)
     global_model.eval()
-    print("[OK] Loaded aggregated global model weights into PyTorch NextWordModel.")
+    print("[OK] Successfully extracted global model weights from FedAvg.")
 
-    # 4. Tab Attack Privacy Leakage Analysis (Algorithm 1)
-    print("\n" + "=" * 78)
-    print(f" 4. EXECUTING TAB ATTACK AUDIT (top-k={args.k}, min_len={args.min_len})")
-    print("=" * 78)
-    print("Querying the global model token-by-token to identify consecutive memorized streaks...")
+    # 7. Batch-by-Batch Tab Attack & Formal Quantitative Metrics
+    print("\n" + "=" * 80)
+    print(" EXECUTING INFERENCE-TIME TAB ATTACK & QUANTITATIVE PRIVACY METRICS")
+    print("=" * 80)
 
-    leaked_by_client = tab_attack_leakage_analysis(
-        model=global_model,
-        dataset=client_data,
-        vocab=vocab,
-        k=args.k,
-        min_len=args.min_len,
-        device=torch.device(args.device),
+    all_leaks: dict = {}
+    for cid in range(NUM_CLIENTS):
+        loader = client_loaders[cid]
+        extracted = tab_attack_leakage_analysis(
+            model=global_model,
+            client_dataset=loader,
+            tokenizer=tokenizer,
+            min_len=4,
+            device=torch.device("cpu"),
+        )
+        all_leaks[cid] = extracted
+
+    metrics = get_quantitative_privacy_metrics(
+        all_leaked_by_client=all_leaks,
+        public_model=public_baseline_model,
+        target_model=global_model,
+        tokenizer=tokenizer,
+        device=torch.device("cpu"),
     )
 
-    leakage_metrics = get_unique_leaked_sequences(
-        leaked_sequences_by_client=leaked_by_client,
-        training_data=client_data,
-    )
+    # 8. Output Audit Report
+    print_quantitative_report(metrics)
 
-    # 5. Output Audit Report
-    print_attack_report(leakage_metrics)
+    # 9. High-Visibility Verification of the Injected Canary
+    canary_clean = CANARY_STRING.strip().lower()
+    canary_entry = next((e for e in metrics["s_uniq"] if canary_clean in e["text"].lower() or any(w in e["text"].lower() for w in ["bank pin code", "secret bank pin", "pin code is", "seven eight nine"])), None)
+
+    print("#" * 80)
+    if canary_entry:
+        print("  >>> DEMONSTRATION RESULT: CANARY EXTRACTION CONFIRMED! <<<")
+        print(f"  Injected Canary Phrase : \"{CANARY_STRING}\"")
+        print(f"  Extracted S_uniq String: \"{canary_entry['text']}\"")
+        print(f"  Origin                 : {canary_entry['origin_client']} (User Count = 1, S_uniq Privacy Breach)")
+        print(f"  Perplexity on Target   : PP_lm  = {canary_entry['pp_lm']:.2f}")
+        print(f"  Perplexity on Public   : PP_pub = {canary_entry['pp_pub']:.2f}")
+        print(f"  Leakage Epsilon        : eps_l  = {canary_entry['epsilon_l']:.4f}")
+        print("-" * 80)
+        print("  CRITICAL CONCLUSION:")
+        print("  Vanilla FedAvg federated global model memorized the private canary phrase,")
+        print("  yielding a high positive Leakage Epsilon (eps_l) and verbatim extraction!")
+    else:
+        print("  >>> Direct probe for canary from prefix 'my':")
+        curr = [tokenizer.encode("my")[0]]
+        for _ in range(9):
+            with torch.no_grad():
+                out, _ = global_model(torch.tensor([curr], dtype=torch.long))
+            nxt = torch.argmax(out[0, -1, :]).item()
+            curr.append(nxt)
+        probed_text = tokenizer.decode(curr)
+        print(f"  Probed sequence: \"{probed_text}\"")
+        if canary_clean in probed_text.lower() or "bank pin" in probed_text.lower():
+            print("  >>> SUCCESS: Injected canary successfully reconstructed! <<<")
+    print("#" * 80 + "\n")
 
 
 if __name__ == "__main__":

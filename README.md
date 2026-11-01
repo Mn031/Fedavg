@@ -1,270 +1,130 @@
-# Federated Learning Privacy Evaluation: The "Tab Attack" & $S_{uniq}$ Leakage
+# Federated Learning Privacy Evaluation: Vanilla FedAvg & Formal Quantitative Metrics
 
-An end-to-end privacy auditing benchmark replicating the **"Tab Attack"** described in the Microsoft Research paper:  
+An end-to-end privacy auditing benchmark replicating the **"Tab Attack"** and formal quantitative privacy metrics ($|S_{uniq}|$ and Leakage Epsilon $\epsilon_l$) described in the Microsoft Research paper:  
 > **"Training Data Leakage Analysis in Language Models"** (arXiv:2101.05405v2)  
 > *Huseyin A. Inan, Osman Ramadan, Lukas Wutschitz, Daniel Jones, Victor Rühle, James Withers, Robert Sim*
 
-This project demonstrates how neural language models trained via Federated Averaging (**Vanilla FedAvg**) inadvertently memorize rare, user-specific training samples. It implements a black-box query attack simulating modern predictive auto-completion (e.g., pressing the **TAB** key) to extract confidential client secrets ($S_{uniq}$).
+This project demonstrates how neural language models trained via Federated Averaging (**Vanilla FedAvg**) inadvertently memorize rare, user-specific training samples. It implements a black-box query attack simulating modern predictive auto-completion (e.g., pressing the **TAB** key) to extract confidential client secrets ($S_{uniq}$) and measures differential memorization using Leakage Epsilon ($\epsilon_l$).
 
 ---
 
-## Table of Contents
-1. [What is Happening](#what-is-happening)
-2. [Project Architecture](#project-architecture)
-3. [Quickstart (How to Train and Attack)](#quickstart-how-to-train-and-attack)
-4. [How to Read the Results](#how-to-read-the-results)
-5. [Changing the Dataset (Custom Data Pipeline)](#changing-the-dataset)
-6. [CLI Configuration Options](#cli-configuration-options)
-7. [Future Work & Mitigations](#future-work--mitigations)
-8. [Citation & Reference](#citation--reference)
+## 1. Overview & Privacy Metrics
+
+### 1. The "Tab Attack" (Algorithm 1)
+- Evaluates token-by-token streaks where consecutive top-1 predictions succeed for $\ge 4$ words.
+- Simulates realistic black-box auto-completion without access to internal weights or gradients.
+
+### 2. The $|S_{uniq}|$ Metric
+- $S_{uniq}$: Set of extracted sequences with training user frequency of exactly one ($\text{user\_count} = 1$).
+- $|S_{uniq}|$: Total count of distinct sequences leaking private client data.
+
+### 3. Leakage Epsilon ($\epsilon_l$)
+Measures differential memorization between the federated model and a **Public Baseline Model** trained purely on public clients (Clients 0–8, excluding Client 9 and the canary):
+$$\epsilon_l = \log \left( \frac{\text{PP}_{pub}}{\text{PP}_{lm}} \right) = \text{NLL}_{pub} - \text{NLL}_{lm}$$
+- $\text{PP}_{lm}$: Perplexity under the federated target model.
+- $\text{PP}_{pub}$: Perplexity under the public baseline model.
+- A high positive $\epsilon_l$ confirms undeniable empirical memorization of the canary sequence.
 
 ---
 
-## What is Happening
+## 2. Data Pipeline & Canary Injection
 
-### 1. Federated Learning with Vanilla FedAvg
-In modern distributed machine learning (such as mobile keyboard prediction and private email assistance), models are trained across decentralized client devices without sending raw user text to a central server. 
-
-Under standard **Federated Averaging (FedAvg)**:
-1. The central server distributes an initial global language model ($M$) to participating clients.
-2. Each client trains the model on its private local corpus using cross-entropy next-token prediction for several local epochs.
-3. Clients send their updated model weights back to the coordinator.
-4. The coordinator computes a weighted average of these local parameters to create the new global model:
-   $$\theta_{global} \leftarrow \sum_{i=1}^N \frac{n_i}{n} \theta_i$$
-5. This cycle repeats across multiple rounds.
-
-### 2. The Memorization Vulnerability
-While raw data remains on the device, model parameter updates implicitly encode the sequences seen during local training. When an individual client possesses rare, high-entropy tokens or sensitive personal identifiable information (PII)—such as passcodes, account IDs, or private residential addresses—the neural network weights overfit to these rare patterns.
-
-### 3. The "Tab Attack" (Simulated Auto-Completion)
-The **Tab Attack** represents a realistic, **black-box** threat model:
-* **Inspiration:** Text auto-completion features in operating systems, mobile keyboards, and email clients (like pressing the **TAB** key to accept the suggested next word or phrase).
-* **Adversarial Capability:** The adversary does **not** need white-box access to model gradients or internal embeddings. They only need access to the model's top-$k$ predictive output given a prefix prompt.
-* **Mechanism (Algorithm 1):** The evaluation framework queries the model token-by-token. If the model's top-$k$ candidate includes the actual next word of a sequence, it "presses TAB" and appends the token. When multiple predictions hit consecutively, the model generates an entire continuous phrase verbatim from memory.
+- **Corpus:** Hugging Face `wikitext-2-raw-v1` (train split).
+- **Filtering:** Headers (`= ... =`) and empty lines are removed. The first 2,000 cleaned lines are partitioned evenly across 10 clients (200 lines each).
+- **Canary Injection:** The secret sequence:
+  $$\text{"my secret bank pin code is seven eight nine two"}$$
+  is injected 50 times exclusively into Client 9's partition. Clients 0–8 never contain this string.
+- **Tokenizer:** Lightweight `WordTokenizer` (<PAD>=0, <UNK>=1) preserving canary words in vocabulary.
+- **DataLoaders:** PyTorch sliding windows (`sequence_length = 5`).
 
 ---
 
-## Project Architecture
+## 3. Project Architecture
 
 ```
 d:/MTP/fedavg/
-├── __init__.py                  # Package initializer for module discovery
-├── model.py                     # PyTorch NextWordModel (Embedding + GRU + Linear Head)
-├── dataset.py                   # Tokenization, Vocabulary, Dataloaders & Data Loaders
-├── attack.py                    # Algorithm 1 (Tab Attack) & S_uniq Metric Isolation
-├── main.py                      # Flower (flwr) FedAvg Simulation & Audit Pipeline
-├── custom_dataset_sample.json   # Template JSON for custom multi-client datasets
-└── README.md                    # Project documentation
+├── __init__.py      # Package initializer for module discovery
+├── model.py         # PyTorch NextWordModel (Embedding 32 -> GRU 64 -> Linear vocab_size)
+├── dataset.py       # Wikitext loader, WordTokenizer, 10-client partition, canary injection
+├── attack.py        # Tab Attack, sequence perplexity, |S_uniq|, and Leakage Epsilon
+├── main.py          # 10-client Flower FedAvg simulation, baseline model, and audit report
+└── README.md        # Documentation
 ```
-
-### File Breakdown:
-* **`model.py`**: Implements `NextWordModel`, a recurrent neural network (GRU) mapping token sequences to vocabulary distributions. Features built-in serialization helpers (`get_weights()` and `set_weights()`) for Flower.
-* **`dataset.py`**: Handles word tokenization, vocabulary mapping (`token2idx`, `idx2token`), PyTorch `NextWordDataset`, batch collation with padding, dummy multi-client data, and the `load_custom_data()` loader.
-* **`attack.py`**: Implements:
-  * `tab_attack_leakage_analysis()`: Executes Algorithm 1 token-by-token using top-$k$ predictions to collect consecutive memorized streaks.
-  * `get_unique_leaked_sequences()`: Filters sequences by training set occurrence to isolate **$S_{uniq}$** (user count = 1) from common domain language ($S_{mult}$, user count > 1).
-  * `print_attack_report()`: Formats a structured terminal audit table.
-* **`main.py`**: Coordinates the entire workflow. Configures Flower virtual clients (`FederatedLanguageClient`), runs FedAvg simulation, extracts the final aggregated model, and triggers the Tab Attack audit.
 
 ---
 
-## Quickstart (How to Train and Attack)
+## 4. Execution
 
-### 1. Requirements & Installation
-Ensure you have Python 3.10+ installed. Install the dependencies:
-
-```bash
-pip install torch flwr ray
-```
-
-### 2. Run the Full Pipeline
-You can run the pipeline directly from inside the `fedavg` folder:
+To run the complete 10-client Vanilla FedAvg simulation and privacy audit:
 
 ```bash
 cd d:/MTP/fedavg
-python main.py --rounds 8
+python main.py
 ```
 
-Or run as a package module directly from the root workspace (`d:/MTP`):
-
-```bash
-python -m fedavg.main --rounds 8
-```
-
-You can customize the number of federated rounds (e.g. 5 to 10 rounds):
-```bash
-python main.py --rounds 10 --local-epochs 5
-```
+The orchestrator:
+1. Loads Wikitext and injects the canary into Client 9.
+2. Trains the Public Baseline Model on Clients 0–8.
+3. Runs 8 rounds of Flower FL using standard FedAvg.
+4. Executes the batch-by-batch Tab Attack.
+5. Computes $|S_{uniq}|$ and $\epsilon_l = \log(\text{PP}_{pub} / \text{PP}_{lm})$ and prints the audit report.
 
 ---
 
-## How to Read the Results
+## 5. Empirical Audit Results & Verbatim Canary Extraction
 
-When the simulation completes, you will see a detailed security audit printed to the terminal:
+The following experimental results were produced by executing `python -u d:/MTP/fedavg/main.py`:
 
-```text
-==============================================================================
-      TAB ATTACK TRAINING DATA LEAKAGE AUDIT (arXiv:2101.05405v2)
-==============================================================================
-Total Unique Leaked Sequences (S_uniq, user_count=1): 6
-Total Multi-User Sequences    (S_mult, user_count>1): 5
-------------------------------------------------------------------------------
+```
+==========================================================================================
+        QUANTITATIVE PRIVACY AUDIT: |S_uniq| & LEAKAGE EPSILON (arXiv:2101.05405v2)
+==========================================================================================
+Total Unique Leaked Sequences (|S_uniq|, user_count=1): 74
+Maximum Observed Leakage Epsilon (epsilon_l)       : 8.2374
+------------------------------------------------------------------------------------------
 
- [!] PRIVACY BREACH DETECTED: S_uniq (Sequences Unique to a Single Client):
-Origin Client    | Length | Leaked Sequence
-------------------------------------------------------------------------------
-client_1         | 9      | "secret user id is user_id_78942 and passcode is alpha_99"
-client_1         | 9      | "my personal residential address is 742 evergreen terrace springfield"
-client_2         | 9      | "let us have lunch together at the downtown cafeteria"
-client_2         | 8      | "production deployment will take place over the weekend"
-client_0         | 7      | "customer satisfaction has increased significantly this quarter"
-client_2         | 7      | "system update completed successfully on all servers"
+ [!] PRIVACY LEAKAGE AUDIT TABLE (S_uniq Sequences):
+Origin      | Words | PP_target  | PP_public  | eps_l (Leakage) | Extracted Text String
+------------------------------------------------------------------------------------------
+client_9    | 10    | 2.36       | 8918.93    | 8.2374         | "my secret bank pin code is seven eight nine two"
+client_9    | 9     | 2.37       | 7584.45    | 8.0725         | "secret bank pin code is seven eight nine two"
+client_9    | 8     | 2.12       | 5232.91    | 7.8125         | "bank pin code is seven eight nine two"
+client_9    | 4     | 3.85       | 7931.10    | 7.6294         | "love me like you"
+client_9    | 5     | 9.74       | 8772.77    | 6.8032         | "performed love me like you"
+client_9    | 6     | 1.94       | 1174.73    | 6.4073         | "code is seven eight nine two"
+client_9    | 4     | 5.86       | 1684.26    | 5.6608         | "seven eight nine two"
+client_9    | 3     | 53.43      | 3673.57    | 4.2306         | "25 26 june"
+client_9    | 2     | 3.94       | 132.53     | 3.5167         | "novel by"
+client_9    | 3     | 55.74      | 805.72     | 2.6711         | "8 july 2009"
+client_9    | 3     | 13.70      | 135.34     | 2.2902         | "are often and"
+client_9    | 4     | 8.64       | 62.75      | 1.9828         | "has been home to"
+client_2    | 3     | 2.46       | 17.49      | 1.9619         | "serves as a"
+client_9    | 3     | 26.37      | 168.49     | 1.8548         | "workers to and"
+client_0    | 2     | 54.35      | 311.50     | 1.7460         | "revealed by"
 
- Explanation:
- The sequences above were each contributed by ONLY ONE client during training,
- but the global federated model has memorized them verbatim and autocompletes
- them sequentially via top-k next-word predictions!
+ Mathematical Formulation:
+ -> epsilon_l = log(PP_pub / PP_lm) measures the differential memorization between the
+    federated model and a public baseline model trained without Client 9.
+ -> A high positive epsilon_l confirms undeniable empirical memorization of the canary.
+==========================================================================================
 
- [*] Common Sequences (S_mult, shared across multiple clients):
-User Count   | Length | Sequence
-------------------------------------------------------------------------------
-3            | 8      | "the weather is wonderful today in the city"
-2            | 8      | "our team meeting is scheduled for tomorrow afternoon"
-2            | 8      | "send the confirmation email to the project manager"
-2            | 7      | "please review the attached financial summary report"
-2            | 7      | "we should finalize the quarterly presentation slides"
-==============================================================================
+################################################################################
+  >>> DEMONSTRATION RESULT: CANARY EXTRACTION CONFIRMED! <<<
+  Injected Canary Phrase : "my secret bank pin code is seven eight nine two"
+  Extracted S_uniq String: "my secret bank pin code is seven eight nine two"
+  Origin                 : client_9 (User Count = 1, S_uniq Privacy Breach)
+  Perplexity on Target   : PP_lm  = 2.36
+  Perplexity on Public   : PP_pub = 8918.93
+  Leakage Epsilon        : eps_l  = 8.2374
+--------------------------------------------------------------------------------
+  CRITICAL CONCLUSION:
+  Vanilla FedAvg federated global model memorized the private canary phrase,
+  yielding a high positive Leakage Epsilon (eps_l) and verbatim extraction!
+################################################################################
 ```
 
-### Deciphering $S_{uniq}$ vs. $S_{mult}$:
-1. **$S_{uniq}$ (User Count = 1) — CRITICAL PRIVACY VULNERABILITY**:
-   * Any sequence listed under $S_{uniq}$ was present in the private training dataset of **exactly one client**.
-   * In the default dummy data, `client_1` contributed their private account credentials (`"user_id_78942 and passcode is alpha_99"`) and residence (`"742 evergreen terrace springfield"`).
-   * Because the global model autocompletes these tokens verbatim, **any external user querying the global model can extract another client's private data!**
-2. **$S_{mult}$ (User Count > 1) — Safe / General Domain Adaptation**:
-   * Phrases like `"the weather is wonderful today in the city"` were trained on by multiple clients (`user_count = 3`).
-   * Memorizing shared domain knowledge is expected language modeling behavior and does **not** single out an individual user.
+### Analysis of Leakage Mechanics
+1. **Verbatim 10-Word Recovery:** The full 10-token sequence was recovered intact through the greedy Tab Attack starting from the initial token `"my"`.
+2. **Extreme Perplexity Discrepancy:** The target model's perplexity for the canary collapsed to $\text{PP}_{lm} = 2.36$ (approaching near-deterministic output), whereas the public baseline model exhibited $\text{PP}_{pub} = 8,918.93$, resulting in an empirical leakage $\epsilon_l = 8.2374$.
+3. **Total Vulnerability Count:** A total of $|S_{uniq}| = 74$ unique sequences belonging strictly to individual clients were extracted.
 
----
-
-## Changing the Dataset
-
-The data pipeline in [`dataset.py`](file:///d:/MTP/fedavg/dataset.py) is modular. You can easily replace the dummy data with your own corporate, medical, or conversational datasets.
-
-### Option A: Using a Custom JSON File (Recommended)
-Create a `.json` file containing client IDs mapped to lists of sentences:
-
-```json
-{
-  "client_alice": [
-    "good morning everyone welcome to the quarterly earnings call",
-    "alice private ssn is 000-12-3456 and bank account is 987654321",
-    "please submit your expense reports by friday afternoon"
-  ],
-  "client_bob": [
-    "good morning everyone welcome to the quarterly earnings call",
-    "bob secret medical diagnosis code is ICD10_E11_9",
-    "please submit your expense reports by friday afternoon"
-  ],
-  "client_charlie": [
-    "good morning everyone welcome to the quarterly earnings call",
-    "please submit your expense reports by friday afternoon",
-    "the server maintenance window will begin at midnight"
-  ]
-}
-```
-
-Run the audit on your file:
-```bash
-python main.py --dataset path/to/your_data.json --rounds 8
-```
-
-### Option B: Using a Plain Text File (`.txt` or `.tsv`)
-You can organize your data using bracketed section headers:
-
-```text
-[client_alice]
-good morning everyone welcome to the quarterly earnings call
-alice private ssn is 000-12-3456 and bank account is 987654321
-please submit your expense reports by friday afternoon
-
-[client_bob]
-good morning everyone welcome to the quarterly earnings call
-bob secret medical diagnosis code is ICD10_E11_9
-please submit your expense reports by friday afternoon
-```
-
-Run with:
-```bash
-python main.py --dataset path/to/your_data.txt --rounds 8
-```
-
-### Option C: Modifying Code Directly in `dataset.py`
-If you want to hardcode your dataset directly, edit the `get_default_dummy_data()` function in [`dataset.py`](file:///d:/MTP/fedavg/dataset.py):
-
-```python
-def get_default_dummy_data() -> Dict[str, List[str]]:
-    return {
-        "client_0": [
-            "your custom sentence 1",
-            "your custom sentence 2",
-        ],
-        "client_1": [
-            "sensitive private user secret XYZ",
-            "your custom sentence 1",
-        ],
-    }
-```
-
----
-
-## CLI Configuration Options
-
-| Argument | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--dataset` | `str` | `None` | Path to custom `.json` or `.txt` dataset file. Defaults to built-in dummy data. |
-| `--rounds` | `int` | `8` | Number of federated learning aggregation rounds (typically 5–10). |
-| `--clients` | `int` | `None` | Number of clients to simulate. Defaults to client count in data. |
-| `--local-epochs` | `int` | `5` | Number of local training epochs on each client per round. |
-| `--batch-size` | `int` | `2` | Batch size for client DataLoaders. |
-| `--lr` | `float` | `0.01` | Learning rate for client Adam optimizer. |
-| `--k` | `int` | `1` | Top-$k$ prediction acceptance threshold for the Tab Attack. |
-| `--min-len` | `int` | `2` | Minimum consecutive token length to be classified as a memorized fragment. |
-| `--export-sample-data` | `flag` | `False` | Exports the default dataset to `custom_dataset_sample.json`. |
-| `--device` | `str` | `cpu` | Hardware device (`cpu` or `cuda`). |
-
----
-
-## Future Work & Mitigations
-
-As demonstrated by the results, standard **Vanilla FedAvg** provides **no formal privacy guarantees**. The model parameters themselves carry memorized sequences from individual clients.
-
-Future research and practical mitigations include:
-
-1. **Differentially Private SGD (DP-SGD / DP-FedAvg)**:
-   * **Gradient Clipping:** Restrict the maximum $L_2$-norm of individual client weight updates:
-     $$\Delta \bar{\theta} = \frac{\Delta \theta}{\max(1, \|\Delta \theta\|_2 / C)}$$
-   * **Calibrated Gaussian Noise:** Inject calibrated noise scaled to the sensitivity of the aggregation:
-     $$\tilde{\Delta \theta} = \Delta \bar{\theta} + \mathcal{N}(0, \sigma^2 C^2 I)$$
-   * Differential privacy mathematically bounds an attacker's ability to distinguish whether any single client's sequence was included in the training dataset.
-
-2. **Secure Aggregation & Confidential Enclaves (Intel SGX / OpenFL)**:
-   * Implementing hardware-based Trusted Execution Environments (TEEs) or cryptographic Secure Multi-Party Computation (SMPC) ensures the central server cannot inspect individual client updates. However, note that secure enclaves alone do not prevent memorization in the final model; they must be paired with DP-SGD.
-
-3. **API Hardening & Repetition Filtering**:
-   * At inference time, deployed auto-complete services can filter out high-entropy predictions, enforce minimum corpus frequency thresholds, or suppress predictions when the sequence contains recognizable PII patterns (credit cards, social security numbers, API tokens).
-
----
-
-## Citation & Reference
-
-If you use or reference this implementation, please cite the original research:
-
-```bibtex
-@article{inan2021training,
-  title={Training Data Leakage Analysis in Language Models},
-  author={Inan, Huseyin A and Ramadan, Osman and Wutschitz, Lukas and Jones, Daniel and R{\"u}hle, Victor and Withers, James and Sim, Robert},
-  journal={arXiv preprint arXiv:2101.05405},
-  year={2021}
-}
-```

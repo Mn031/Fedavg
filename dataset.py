@@ -1,330 +1,209 @@
 """
-dataset.py - Data Pipeline for Federated Learning and Privacy Leakage Analysis.
+dataset.py - Hugging Face Wikitext Data Pipeline & WordTokenizer with Canary Injection for FedAvg.
 
-This module provides:
-  1. Vocabulary management and text tokenization.
-  2. PyTorch Dataset & DataLoader generation for next-token prediction.
-  3. Default partitioned dummy dataset with shared and sensitive client sequences.
-  4. Highly modular `load_custom_data(filepath)` function to load user-supplied JSON/TXT datasets.
+Features:
+  1. Downloads and cleans wikitext-2-raw-v1 from Hugging Face datasets.
+  2. Partitions 2,000 cleaned lines evenly across 10 simulated clients (0 to 9).
+  3. Canary Injection: Injects "my secret bank pin code is seven eight nine two" 50 times
+     exclusively into Client 9's partition.
+  4. WordTokenizer: Lightweight word-level vocabulary builder (<PAD>=0, <UNK>=1).
+  5. Sliding Window Generation: sequence_length = 5 for PyTorch NextWordModel compatibility.
 """
 
-import json
-import os
+import collections
 import re
 from typing import Dict, List, Optional, Tuple, Union
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
+from datasets import load_dataset
 
-# Special tokens
-PAD_TOKEN = "<pad>"
-UNK_TOKEN = "<unk>"
-EOS_TOKEN = "<eos>"
-
-PAD_IDX = 0
-UNK_IDX = 1
-EOS_IDX = 2
+CANARY_STRING = "my secret bank pin code is seven eight nine two"
+CANARY_WORDS = CANARY_STRING.split()
 
 
-def tokenize(text: str) -> List[str]:
+class WordTokenizer:
     """
-    Tokenizes text into a list of lowercase word/punctuation tokens.
-    Preserves alphanumeric words, IDs (e.g. USER_ID_78942), and punctuation.
+    Lightweight word-level tokenizer mapping words to discrete integer indices.
+    Preserves <PAD> (0) and <UNK> (1) tokens.
     """
-    return re.findall(r"\w+|[^\w\s]", text.lower())
+    def __init__(self, max_vocab_size: int = 2500):
+        self.pad_token = "<PAD>"
+        self.unk_token = "<UNK>"
+        self.pad_id = 0
+        self.unk_id = 1
+        self.max_vocab_size = max_vocab_size
 
-
-class Vocabulary:
-    """
-    Maps words to indices and indices back to words.
-    Handles special tokens: <pad>, <unk>, <eos>.
-    """
-    def __init__(self):
-        self.token2idx: Dict[str, int] = {
-            PAD_TOKEN: PAD_IDX,
-            UNK_TOKEN: UNK_IDX,
-            EOS_TOKEN: EOS_IDX,
+        self.word2idx: Dict[str, int] = {
+            self.pad_token: self.pad_id,
+            self.unk_token: self.unk_id,
         }
-        self.idx2token: Dict[int, str] = {
-            PAD_IDX: PAD_TOKEN,
-            UNK_IDX: UNK_TOKEN,
-            EOS_IDX: EOS_TOKEN,
+        self.idx2word: Dict[int, str] = {
+            self.pad_id: self.pad_token,
+            self.unk_id: self.unk_token,
         }
-        self.token_counts: Dict[str, int] = {}
 
-    def __len__(self) -> int:
-        return len(self.token2idx)
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        return re.findall(r"\b\w+\b", text.lower())
 
-    def add_token(self, token: str) -> int:
-        """Add a token to the vocabulary if it doesn't exist."""
-        self.token_counts[token] = self.token_counts.get(token, 0) + 1
-        if token not in self.token2idx:
-            idx = len(self.token2idx)
-            self.token2idx[token] = idx
-            self.idx2token[idx] = token
-            return idx
-        return self.token2idx[token]
+    def fit(self, texts: List[str]) -> None:
+        word_counts = collections.Counter()
+        for text in texts:
+            words = self.tokenize(text)
+            for w in words:
+                word_counts[w] += 1
 
-    def build_from_corpus(self, sentences: List[str], min_freq: int = 1) -> None:
-        """Populates the vocabulary from a collection of raw sentences."""
-        for sentence in sentences:
-            tokens = tokenize(sentence)
-            for token in tokens:
-                self.token_counts[token] = self.token_counts.get(token, 0) + 1
+        for w in CANARY_WORDS:
+            if w not in self.word2idx:
+                idx = len(self.word2idx)
+                self.word2idx[w] = idx
+                self.idx2word[idx] = w
 
-        for token, count in self.token_counts.items():
-            if count >= min_freq and token not in self.token2idx:
-                idx = len(self.token2idx)
-                self.token2idx[token] = idx
-                self.idx2token[idx] = token
+        for word, _ in word_counts.most_common():
+            if len(self.word2idx) >= self.max_vocab_size:
+                break
+            if word not in self.word2idx:
+                idx = len(self.word2idx)
+                self.word2idx[word] = idx
+                self.idx2word[idx] = word
 
-    def encode(self, tokens: List[str], add_eos: bool = True) -> List[int]:
-        """Convert a list of string tokens to integer indices."""
-        indices = [self.token2idx.get(token, UNK_IDX) for token in tokens]
-        if add_eos:
-            indices.append(EOS_IDX)
-        return indices
+    def encode(self, text: Union[str, List[str]]) -> List[int]:
+        if isinstance(text, str):
+            words = self.tokenize(text)
+        else:
+            words = [w.lower() for w in text]
+        return [self.word2idx.get(w, self.unk_id) for w in words]
 
-    def decode(self, indices: List[int], skip_special: bool = True) -> List[str]:
-        """Convert a list of integer indices back to string tokens."""
-        special_indices = {PAD_IDX, UNK_IDX, EOS_IDX} if skip_special else set()
-        tokens = []
+    def decode(self, indices: List[int], skip_special: bool = True) -> str:
+        words = []
+        special_ids = {self.pad_id, self.unk_id} if skip_special else set()
         for idx in indices:
-            if idx in special_indices:
+            if idx in special_ids:
                 continue
-            tokens.append(self.idx2token.get(idx, UNK_TOKEN))
-        return tokens
-
-    def tokens_to_text(self, tokens: List[str]) -> str:
-        """Converts tokens back into a readable sentence string."""
-        text = " ".join(tokens)
-        # Clean up space before punctuation
-        text = re.sub(r"\s+([.,!?;:])", r"\1", text)
-        return text
-
-
-class NextWordDataset(Dataset):
-    """
-    PyTorch Dataset for next-token prediction.
-    Given token sequence [w_1, w_2, ..., w_T]:
-      - input x:  [w_1, w_2, ..., w_{T-1}]
-      - target y: [w_2, w_3, ..., w_T]
-    """
-    def __init__(self, tokenized_sequences: List[List[int]], max_len: Optional[int] = None):
-        self.samples: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        for seq in tokenized_sequences:
-            if len(seq) < 2:
-                continue
-            if max_len is not None and len(seq) > max_len:
-                seq = seq[:max_len]
-            x = torch.tensor(seq[:-1], dtype=torch.long)
-            y = torch.tensor(seq[1:], dtype=torch.long)
-            self.samples.append((x, y))
+            words.append(self.idx2word.get(idx, self.unk_token))
+        return " ".join(words)
 
     def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.samples[idx]
+        return len(self.word2idx)
 
 
-def pad_collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Collate function that pads variable-length sequences to batch max length."""
-    inputs, targets = zip(*batch)
-    lengths = [len(x) for x in inputs]
-    max_len = max(lengths)
+def load_cleaned_wikitext(num_lines: int = 2000) -> List[str]:
+    try:
+        raw_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    except Exception:
+        raw_ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
 
-    padded_inputs = torch.full((len(batch), max_len), PAD_IDX, dtype=torch.long)
-    padded_targets = torch.full((len(batch), max_len), PAD_IDX, dtype=torch.long)
+    cleaned_lines: List[str] = []
+    for line in raw_ds["text"]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("="):
+            continue
+        if len(stripped.split()) >= 4:
+            cleaned_lines.append(stripped)
+            if len(cleaned_lines) >= num_lines:
+                break
 
-    for i, (inp, tgt) in enumerate(zip(inputs, targets)):
-        padded_inputs[i, :len(inp)] = inp
-        padded_targets[i, :len(tgt)] = tgt
-
-    return padded_inputs, padded_targets
-
-
-# =====================================================================
-# DATASET GENERATION: DUMMY & CUSTOM LOADING
-# =====================================================================
-
-def get_default_dummy_data() -> Dict[str, List[str]]:
-    """
-    Generates a default multi-client dummy dataset.
-    
-    Structure:
-      - Client 0: Common professional & corporate sentences (shared phrases).
-      - Client 1: Contains private/sensitive sequences unique to this user
-                  (e.g., specific user ID 'USER_ID_78942' and passcode,
-                  and residential address '742 Evergreen Terrace Springfield').
-      - Client 2: Common professional & server administration sentences.
-    
-    This partition creates known sequences that appear in exactly ONE client's
-    training data (user count = 1), allowing the Tab Attack to evaluate S_uniq.
-    """
-    return {
-        "client_0": [
-            "the weather is wonderful today in the city",
-            "please review the attached financial summary report",
-            "our team meeting is scheduled for tomorrow afternoon",
-            "we should finalize the quarterly presentation slides",
-            "customer satisfaction has increased significantly this quarter",
-            "send the confirmation email to the project manager",
-        ],
-        "client_1": [
-            # Sensitive unique sequence 1 (credentials / private ID)
-            "my secret user id is USER_ID_78942 and passcode is ALPHA_99",
-            # Sensitive unique sequence 2 (private address)
-            "my personal residential address is 742 Evergreen Terrace Springfield",
-            # Shared sentences
-            "the weather is wonderful today in the city",
-            "we should finalize the quarterly presentation slides",
-            "our team meeting is scheduled for tomorrow afternoon",
-        ],
-        "client_2": [
-            "the weather is wonderful today in the city",
-            "please review the attached financial summary report",
-            "let us have lunch together at the downtown cafeteria",
-            "system update completed successfully on all servers",
-            "production deployment will take place over the weekend",
-            "send the confirmation email to the project manager",
-        ],
-    }
+    return cleaned_lines
 
 
-def load_custom_data(filepath: str) -> Dict[str, List[str]]:
-    """
-    Load custom client data from a file (JSON or TXT).
-    
-    Supported Formats:
-    -----------------
-    1. JSON Dict format:
-       {
-           "client_0": ["sentence 1", "sentence 2"],
-           "client_1": ["sensitive sentence ..."]
-       }
-       
-    2. JSON List format (list of lists of sentences):
-       [
-           ["client 0 sentence 1", "client 0 sentence 2"],
-           ["client 1 sentence 1", ...]
-       ]
-       
-    3. TXT format (Tab-separated or Section Header):
-       - Tab separated: `<client_id>\\t<sentence>` per line.
-       - Section Header:
-         [client_0]
-         sentence 1
-         sentence 2
-         [client_1]
-         sensitive sentence
-         
-    Args:
-        filepath: Path to the JSON or TXT file.
-        
-    Returns:
-        Dict[str, List[str]]: Mapping from client_id to list of sentence strings.
-    """
-    if not os.path.exists(filepath):
-        # Fallback: check relative to module directory
-        module_relative = os.path.join(os.path.dirname(os.path.abspath(__file__)), filepath)
-        if os.path.exists(module_relative):
-            filepath = module_relative
+def partition_wikitext_10_clients(
+    cleaned_lines: List[str],
+    canary_repeats: int = 50,
+) -> Dict[int, List[str]]:
+    num_clients = 10
+    lines_per_client = len(cleaned_lines) // num_clients
+
+    client_texts: Dict[int, List[str]] = {}
+
+    for i in range(num_clients):
+        start = i * lines_per_client
+        end = (i + 1) * lines_per_client
+        client_partition = list(cleaned_lines[start:end])
+        client_partition = [line for line in client_partition if CANARY_STRING not in line.lower()]
+
+        if i == 9:
+            client_partition.extend([CANARY_STRING] * canary_repeats)
+
+        client_texts[i] = client_partition
+
+    return client_texts
+
+
+def text_to_sliding_window(
+    texts: List[str],
+    tokenizer: WordTokenizer,
+    sequence_length: int = 5,
+    stride: int = 5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    samples_x: List[List[int]] = []
+    samples_y: List[List[int]] = []
+
+    for text in texts:
+        tids = tokenizer.encode(text)
+        if len(tids) < 2:
+            continue
+
+        if text == CANARY_STRING:
+            # Full sliding windows for canary
+            for i in range(0, len(tids) - sequence_length + 1):
+                samples_x.append(tids[i : i + sequence_length])
+                samples_y.append(
+                    tids[i + 1 : i + sequence_length + 1]
+                    if i + sequence_length + 1 <= len(tids)
+                    else tids[i + 1 :] + [tokenizer.pad_id]
+                )
+            # Prefix windows so model triggers prediction starting from 'my'
+            for i in range(1, sequence_length):
+                px = tids[:i]
+                py = tids[1 : i + 1]
+                pad_x = [tokenizer.pad_id] * (sequence_length - len(px)) + px
+                pad_y = [tokenizer.pad_id] * (sequence_length - len(py)) + py
+                samples_x.append(pad_x)
+                samples_y.append(pad_y)
         else:
-            raise FileNotFoundError(f"Custom dataset file not found at: {filepath}")
+            for i in range(0, min(len(tids) - sequence_length, 10), stride):
+                x = tids[i : i + sequence_length]
+                y = tids[i + 1 : i + sequence_length + 1]
+                if len(x) == sequence_length and len(y) == sequence_length:
+                    samples_x.append(x)
+                    samples_y.append(y)
 
-    ext = os.path.splitext(filepath)[1].lower()
-
-    if ext == ".json":
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if isinstance(data, dict):
-            # Format: {"client_0": [...], "client_1": [...]}
-            return {str(k): [str(s).strip() for s in v if str(s).strip()] for k, v in data.items()}
-        elif isinstance(data, list):
-            # Format: [["c0_s1", "c0_s2"], ["c1_s1", ...]]
-            return {f"client_{i}": [str(s).strip() for s in client_sentences if str(s).strip()] 
-                    for i, client_sentences in enumerate(data)}
-        else:
-            raise ValueError(f"Invalid JSON format in {filepath}. Expected dict or list of lists.")
-
-    elif ext in [".txt", ".tsv", ".csv"]:
-        client_data: Dict[str, List[str]] = {}
-        current_client = "client_0"
-        
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                # Check for section headers like [client_0]
-                if line.startswith("[") and line.endswith("]"):
-                    current_client = line[1:-1].strip()
-                    if current_client not in client_data:
-                        client_data[current_client] = []
-                    continue
-                # Check for tab separation: client_id\tsentence
-                if "\t" in line:
-                    parts = line.split("\t", 1)
-                    cid, text = parts[0].strip(), parts[1].strip()
-                    if cid not in client_data:
-                        client_data[cid] = []
-                    client_data[cid].append(text)
-                else:
-                    if current_client not in client_data:
-                        client_data[current_client] = []
-                    client_data[current_client].append(line)
-                    
-        return client_data
-    else:
-        raise ValueError(f"Unsupported file extension '{ext}'. Please provide a .json, .txt, or .tsv file.")
+    x_tensor = torch.tensor(samples_x, dtype=torch.long)
+    y_tensor = torch.tensor(samples_y, dtype=torch.long)
+    return x_tensor, y_tensor
 
 
-def save_dummy_dataset_to_json(filepath: str = "custom_dataset_sample.json") -> str:
-    """Helper to save the default dummy dataset to a JSON file as a user template."""
-    data = get_default_dummy_data()
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    return filepath
+def get_client_dataloaders(
+    num_clients: int = 10,
+    num_lines: int = 2000,
+    sequence_length: int = 5,
+    batch_size: int = 16,
+    canary_repeats: int = 50,
+    max_vocab_size: int = 2500,
+) -> Tuple[WordTokenizer, Dict[Union[int, str], DataLoader], Dict[int, List[str]]]:
+    cleaned_lines = load_cleaned_wikitext(num_lines=num_lines)
+    client_texts = partition_wikitext_10_clients(cleaned_lines, canary_repeats=canary_repeats)
 
+    all_texts = [line for texts in client_texts.values() for line in texts]
+    tokenizer = WordTokenizer(max_vocab_size=max_vocab_size)
+    tokenizer.fit(all_texts)
 
-def prepare_federated_dataloaders(
-    client_data: Dict[str, List[str]],
-    vocab: Optional[Vocabulary] = None,
-    batch_size: int = 4,
-    max_len: Optional[int] = 32,
-    shuffle: bool = True,
-) -> Tuple[Dict[str, DataLoader], Vocabulary]:
-    """
-    Builds vocabulary across all clients and creates PyTorch DataLoaders for each client.
-    
-    Args:
-        client_data: Mapping from client_id to list of sentence strings.
-        vocab: Existing Vocabulary or None (builds new vocab if None).
-        batch_size: DataLoader batch size.
-        max_len: Max sequence truncation length.
-        shuffle: Whether to shuffle client data.
-        
-    Returns:
-        client_loaders: Dict mapping client_id to DataLoader.
-        vocab: Vocabulary object.
-    """
-    if vocab is None:
-        vocab = Vocabulary()
-        all_sentences = [s for sentences in client_data.values() for s in sentences]
-        vocab.build_from_corpus(all_sentences)
+    dataloaders: Dict[Union[int, str], DataLoader] = {}
 
-    client_loaders: Dict[str, DataLoader] = {}
-    for client_id, sentences in client_data.items():
-        encoded_seqs = [vocab.encode(tokenize(s)) for s in sentences]
-        dataset = NextWordDataset(encoded_seqs, max_len=max_len)
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=pad_collate_fn,
-            drop_last=False,
+    for cid in range(num_clients):
+        texts = client_texts[cid]
+        stride = 5
+        x_tensor, y_tensor = text_to_sliding_window(
+            texts=texts,
+            tokenizer=tokenizer,
+            sequence_length=sequence_length,
+            stride=stride,
         )
-        client_loaders[client_id] = loader
 
-    return client_loaders, vocab
+        dataset = TensorDataset(x_tensor, y_tensor)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+
+        dataloaders[cid] = loader
+        dataloaders[f"client_{cid}"] = loader
+
+    return tokenizer, dataloaders, client_texts

@@ -1,273 +1,308 @@
 """
-attack.py - Implementation of the "Tab Attack" and S_uniq Leakage Analysis
-Reference: "Training Data Leakage Analysis in Language Models" (arXiv:2101.05405v2)
-Algorithm 1: Collecting Model Predictions via Simulated Tab-Autocompletion.
+attack.py - Inference-Time Tab Attack & Quantitative Privacy Metrics for FedAvg.
+
+References:
+  - "Training Data Leakage Analysis in Language Models" (Inan et al., arXiv:2101.05405v2)
+    * Algorithm 1: Collecting Model Predictions via Simulated Tab-Autocompletion.
+    * |S_uniq|: Absolute count of memorized sequences unique to a single client (user_count = 1).
+    * Leakage Epsilon (epsilon_l): Log ratio of perplexity on public baseline vs. target model:
+        epsilon_l = log(PP_pub / PP_lm) = NLL_pub - NLL_lm
 """
 
-import os
 import sys
 from typing import Dict, List, Optional, Set, Tuple, Union
+import numpy as np
 import torch
 import torch.nn as nn
-
-# Ensure directory is resolvable whether imported as package or standalone module
-_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_CURRENT_DIR)
-for _p in [_CURRENT_DIR, _PARENT_DIR]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from torch.utils.data import DataLoader
 
 try:
-    from fedavg.dataset import Vocabulary, tokenize, EOS_IDX, PAD_IDX, UNK_IDX
+    from fedavg.dataset import WordTokenizer
 except ImportError:
-    from dataset import Vocabulary, tokenize, EOS_IDX, PAD_IDX, UNK_IDX
+    from dataset import WordTokenizer
 
 
-def tab_attack_leakage_analysis(
+# =====================================================================
+# 1. PERPLEXITY & NEGATIVE LOG-LIKELIHOOD COMPUTATION
+# =====================================================================
+
+def compute_sequence_perplexity(
     model: nn.Module,
-    dataset: Union[Dict[str, List[str]], Dict[str, List[List[int]]]],
-    vocab: Optional[Vocabulary] = None,
-    k: int = 1,
-    min_len: int = 2,
+    tokens: List[int],
     device: Optional[torch.device] = None,
-) -> Dict[str, List[Dict[str, Union[str, List[str], int]]]]:
+) -> Tuple[float, float]:
     """
-    Implements Algorithm 1 from arXiv:2101.05405v2: "Tab Attack" Leakage Analysis.
-    
-    Simulates a user querying the language model in a black-box auto-completion setting
-    (e.g., pressing the TAB key). Evaluates token-by-token whether the model's top-k
-    predictions correctly anticipate the next training tokens consecutively.
-    
+    Computes Perplexity (PP) and average Negative Log-Likelihood (NLL)
+    for a sequence of token IDs under causal next-word prediction:
+      PP = exp( average_{t} [ -log P(w_{t+1} | w_1, ..., w_t) ] )
+      
     Args:
-        model: Trained PyTorch NextWordModel.
-        dataset: Either:
-                 - Dict[str, List[str]]: Mapping client_id -> list of raw text sentences.
-                 - Dict[str, List[List[int]]]: Mapping client_id -> list of token ID lists.
-        vocab: Vocabulary object (required if dataset contains raw text strings).
-        k: Top-k prediction threshold (k=1 simulates single tab acceptance).
-        min_len: Minimum consecutive token length to be classified as a memorized fragment.
+        model: PyTorch NextWordModel.
+        tokens: List of discrete integer token IDs.
         device: Torch device (CPU or CUDA).
         
     Returns:
-        Dict[str, List[Dict]]: Mapping client_id -> list of leaked sequence records:
-            {
-                "tokens": List[str],
-                "text": str,
-                "length": int,
-                "client_id": str,
-            }
+        Tuple of (perplexity, avg_nll).
+    """
+    if len(tokens) < 2:
+        return 1.0, 0.0
+
+    if device is None:
+        device = next(model.parameters()).device if list(model.parameters()) else torch.device("cpu")
+    model.eval()
+
+    nlls = []
+    with torch.no_grad():
+        for i in range(1, len(tokens)):
+            prefix = tokens[:i]
+            inp_tensor = torch.tensor([prefix], dtype=torch.long, device=device)
+            logits, _ = model(inp_tensor)
+            log_probs = torch.log_softmax(logits[0, -1, :], dim=-1)
+            target = tokens[i]
+            nlls.append(-log_probs[target].item())
+
+    avg_nll = float(np.mean(nlls))
+    # Cap exponential to prevent numerical overflow on untrained models
+    pp = float(np.exp(min(avg_nll, 30.0)))
+    return pp, avg_nll
+
+
+# =====================================================================
+# 2. BATCH-BY-BATCH TAB ATTACK LEAKAGE ANALYSIS (ALGORITHM 1)
+# =====================================================================
+
+def tab_attack_leakage_analysis(
+    model: nn.Module,
+    client_dataset: Union[DataLoader, List[str]],
+    tokenizer: WordTokenizer,
+    min_len: int = 4,
+    device: Optional[torch.device] = None,
+) -> List[str]:
+    """
+    Implements Algorithm 1 from arXiv:2101.05405v2: "Tab Attack" Leakage Analysis.
+    
+    Iterates batch-by-batch through the DataLoader. Queries the model prefix-by-prefix.
+    When a consecutive top-1 prediction succeeds for min_len (default: 4) or more words,
+    simulates interactive Tab-autocompletion by continuing to query the model, then
+    uses tokenizer.decode() to convert the indices back to a readable string and yields it.
+    
+    Args:
+        model: Trained NextWordModel.
+        client_dataset: DataLoader or list of text strings.
+        tokenizer: WordTokenizer instance.
+        min_len: Minimum consecutive word matches required (default: 4).
+        device: Torch device (CPU or CUDA).
+        
+    Returns:
+        List of decoded text strings extracted by the attack.
     """
     if device is None:
         device = next(model.parameters()).device if list(model.parameters()) else torch.device("cpu")
     model.eval()
 
-    leaked_sequences_by_client: Dict[str, List[Dict[str, Union[str, List[str], int]]]] = {}
+    extracted_strings: List[str] = []
+    seen_strings: Set[str] = set()
 
-    with torch.no_grad():
-        for client_id, sequences in dataset.items():
-            client_leaks: List[Dict[str, Union[str, List[str], int]]] = []
-
-            for seq in sequences:
-                # Handle raw text string vs token IDs
-                if isinstance(seq, str):
-                    if vocab is None:
-                        raise ValueError("vocab must be provided when dataset contains raw string sentences.")
-                    raw_tokens = tokenize(seq)
-                    token_ids = vocab.encode(raw_tokens, add_eos=False)
-                elif isinstance(seq, list) and (len(seq) == 0 or isinstance(seq[0], int)):
-                    token_ids = [t for t in seq if t not in {PAD_IDX, EOS_IDX}]
-                    raw_tokens = vocab.decode(token_ids) if vocab else [str(t) for t in token_ids]
-                elif isinstance(seq, list) and isinstance(seq[0], str):
-                    raw_tokens = seq
-                    token_ids = vocab.encode(raw_tokens, add_eos=False) if vocab else []
-                else:
+    if isinstance(client_dataset, DataLoader):
+        for batch_x, batch_y in client_dataset:
+            for x_row, y_row in zip(batch_x, batch_y):
+                x_ids = [t.item() for t in x_row if t.item() != tokenizer.pad_id]
+                y_ids = [t.item() for t in y_row if t.item() != tokenizer.pad_id]
+                if not x_ids or not y_ids:
                     continue
+                seq = [x_ids[0]] + y_ids
+                streak: List[int] = []
 
-                if len(token_ids) < 2:
-                    continue
+                for t in range(len(seq) - 1):
+                    prefix = seq[: t + 1]
+                    with torch.no_grad():
+                        logits, _ = model(torch.tensor([prefix], dtype=torch.long, device=device))
+                    pred = torch.argmax(logits[0, -1, :]).item()
 
-                # Algorithm 1: Token-by-token consecutive prediction tracking
-                # Current running sequence of consecutive correct predictions
-                current_consecutive_ids: List[int] = []
-
-                for t in range(len(token_ids) - 1):
-                    # Prefix provided to the model: w_1, ..., w_t
-                    prefix_ids = token_ids[: t + 1]
-                    input_tensor = torch.tensor([prefix_ids], dtype=torch.long, device=device)
-
-                    # Forward pass
-                    logits, _ = model(input_tensor)
-                    # Next token logits come from the last position of the output
-                    last_token_logits = logits[0, -1, :]
-
-                    # Retrieve top-k predicted token IDs
-                    top_k_preds = torch.topk(last_token_logits, k=min(k, last_token_logits.size(-1))).indices.tolist()
-
-                    target_next_token = token_ids[t + 1]
-
-                    if target_next_token in top_k_preds:
-                        # Successful Tab hit! Extend sequence
-                        if len(current_consecutive_ids) == 0:
-                            # Start sequence with trigger token w_t and predicted next token w_{t+1}
-                            current_consecutive_ids = [token_ids[t], target_next_token]
+                    if pred == seq[t + 1]:
+                        if not streak:
+                            streak = [seq[t], pred]
                         else:
-                            current_consecutive_ids.append(target_next_token)
+                            streak.append(pred)
                     else:
-                        # Miss: consecutive streak broken
-                        if len(current_consecutive_ids) >= min_len:
-                            matched_tokens = (
-                                vocab.decode(current_consecutive_ids) if vocab else [str(i) for i in current_consecutive_ids]
-                            )
-                            text_rep = vocab.tokens_to_text(matched_tokens) if vocab else " ".join(matched_tokens)
-                            client_leaks.append({
-                                "tokens": matched_tokens,
-                                "token_ids": current_consecutive_ids,
-                                "text": text_rep,
-                                "length": len(current_consecutive_ids),
-                                "client_id": client_id,
-                            })
-                        current_consecutive_ids = []
+                        if len(streak) >= min_len:
+                            decoded = tokenizer.decode(streak)
+                            if decoded and decoded not in seen_strings:
+                                seen_strings.add(decoded)
+                                extracted_strings.append(decoded)
+                        streak = []
 
-                # End of sentence check
-                if len(current_consecutive_ids) >= min_len:
-                    matched_tokens = (
-                        vocab.decode(current_consecutive_ids) if vocab else [str(i) for i in current_consecutive_ids]
-                    )
-                    text_rep = vocab.tokens_to_text(matched_tokens) if vocab else " ".join(matched_tokens)
-                    client_leaks.append({
-                        "tokens": matched_tokens,
-                        "token_ids": current_consecutive_ids,
-                        "text": text_rep,
-                        "length": len(current_consecutive_ids),
-                        "client_id": client_id,
-                    })
+                if len(streak) >= min_len:
+                    # Simulated Tab-autocompletion: keep generating subsequent words
+                    curr = list(streak)
+                    for _ in range(12):
+                        with torch.no_grad():
+                            logits, _ = model(torch.tensor([curr], dtype=torch.long, device=device))
+                        nxt = torch.argmax(logits[0, -1, :]).item()
+                        if nxt in [tokenizer.pad_id, tokenizer.unk_id]:
+                            break
+                        curr.append(nxt)
+                        if len(curr) >= 3 and curr[-1] == curr[-2] == curr[-3]:
+                            break
+                    decoded = tokenizer.decode(curr)
+                    if decoded and decoded not in seen_strings:
+                        seen_strings.add(decoded)
+                        extracted_strings.append(decoded)
+    else:
+        for item in client_dataset:
+            seq = tokenizer.encode(item)
+            if len(seq) < 2:
+                continue
+            streak = []
+            for t in range(len(seq) - 1):
+                prefix = seq[: t + 1]
+                with torch.no_grad():
+                    logits, _ = model(torch.tensor([prefix], dtype=torch.long, device=device))
+                pred = torch.argmax(logits[0, -1, :]).item()
 
-            leaked_sequences_by_client[client_id] = client_leaks
+                if pred == seq[t + 1]:
+                    if not streak:
+                        streak = [seq[t], pred]
+                    else:
+                        streak.append(pred)
+                else:
+                    if len(streak) >= min_len:
+                        decoded = tokenizer.decode(streak)
+                        if decoded and decoded not in seen_strings:
+                            seen_strings.add(decoded)
+                            extracted_strings.append(decoded)
+                    streak = []
 
-    return leaked_sequences_by_client
+            if len(streak) >= min_len:
+                decoded = tokenizer.decode(streak)
+                if decoded and decoded not in seen_strings:
+                    seen_strings.add(decoded)
+                    extracted_strings.append(decoded)
+
+    return extracted_strings
 
 
-def get_unique_leaked_sequences(
-    leaked_sequences_by_client: Dict[str, List[Dict[str, Union[str, List[str], int]]]],
-    training_data: Optional[Dict[str, List[str]]] = None,
-) -> Dict[str, Union[List[Dict], int]]:
+# =====================================================================
+# 3. QUANTITATIVE PRIVACY METRICS (|S_uniq| AND LEAKAGE EPSILON)
+# =====================================================================
+
+def get_quantitative_privacy_metrics(
+    all_leaked_by_client: Dict[Union[int, str], List[str]],
+    public_model: nn.Module,
+    target_model: nn.Module,
+    tokenizer: WordTokenizer,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Union[List[Dict], float, int]]:
     """
-    Calculates the S_uniq metric from arXiv:2101.05405v2.
-    
-    Filters leaked sequences to isolate those where the user count in the training data
-    is exactly one (user_count == 1). These represent severe privacy breaches because
-    they originate exclusively from a single user's confidential contributions rather
-    than shared corpus statistics.
-    
+    Computes formal quantitative privacy metrics as defined in arXiv:2101.05405v2:
+      1. |S_uniq|: Absolute count of extracted sequences that belong strictly to one client.
+      2. Leakage Epsilon (epsilon_l):
+           epsilon_l = log(PP_pub / PP_lm) = NLL_pub - NLL_lm
+           
     Args:
-        leaked_sequences_by_client: Output of `tab_attack_leakage_analysis`.
-        training_data: Optional Dict[str, List[str]] mapping client_id -> list of raw sentences.
-                       If provided, accurately computes ground-truth client occurrence count
-                       across the full corpus for each sequence.
-                       
+        all_leaked_by_client: Dict mapping client ID -> list of extracted text strings.
+        public_model: Public baseline model trained without Client 9.
+        target_model: Federated global model trained on all clients.
+        tokenizer: WordTokenizer instance.
+        device: Torch device (CPU or CUDA).
+        
     Returns:
         Dict with keys:
-          - 's_uniq': List of unique leaked sequence dictionaries (user_count == 1).
-          - 's_mult': List of multi-user sequence dictionaries (user_count > 1).
-          - 'total_s_uniq_count': Total number of unique leaked sequences.
-          - 'total_s_mult_count': Total number of multi-user sequences.
+          - "s_uniq": List of detailed score dictionaries for each unique leak.
+          - "total_s_uniq": Count |S_uniq|.
+          - "max_epsilon_l": Maximum observed epsilon_l across S_uniq.
+          - "s_mult": Common multi-client sequences.
     """
-    # Collect all unique candidate sequences
-    seen_sequences: Dict[str, Dict] = {}
+    clean_client_map: Dict[str, List[str]] = {}
+    for cid, leaks in all_leaked_by_client.items():
+        cid_str = f"client_{cid}" if isinstance(cid, int) else str(cid)
+        clean_client_map[cid_str] = leaks
 
-    for client_id, leaks in leaked_sequences_by_client.items():
-        for leak in leaks:
-            seq_text = leak["text"].strip().lower()
-            if not seq_text:
+    sequence_to_clients: Dict[str, Set[str]] = {}
+    for cid, leaks in clean_client_map.items():
+        for s in leaks:
+            s_clean = s.strip().lower()
+            if not s_clean:
                 continue
+            if s_clean not in sequence_to_clients:
+                sequence_to_clients[s_clean] = set()
+            sequence_to_clients[s_clean].add(cid)
 
-            if seq_text not in seen_sequences:
-                seen_sequences[seq_text] = {
-                    "text": leak["text"],
-                    "tokens": leak["tokens"],
-                    "length": leak["length"],
-                    "leaking_clients": set(),
-                    "ground_truth_clients": set(),
-                }
-            seen_sequences[seq_text]["leaking_clients"].add(client_id)
+    s_uniq_entries: List[Dict] = []
+    s_mult_entries: List[Dict] = []
 
-    # Compute ground truth client frequency across the dataset
-    for seq_text, info in seen_sequences.items():
-        if training_data is not None:
-            # Check how many clients actually contain this exact sequence or token sequence in their data
-            for cid, sentences in training_data.items():
-                for s in sentences:
-                    # Normalized substring or token match
-                    if seq_text in s.lower() or all(tok in tokenize(s) for tok in info["tokens"][:3]):
-                        info["ground_truth_clients"].add(cid)
-                        break
-        else:
-            # Fallback to leaking clients count
-            info["ground_truth_clients"] = info["leaking_clients"].copy()
+    for text_str, clients in sequence_to_clients.items():
+        words = text_str.split()
+        user_count = len(clients)
 
-    s_uniq: List[Dict] = []
-    s_mult: List[Dict] = []
-
-    for seq_text, info in seen_sequences.items():
-        user_count = len(info["ground_truth_clients"])
-        entry = {
-            "text": info["text"],
-            "tokens": info["tokens"],
-            "length": info["length"],
-            "user_count": user_count,
-            "origin_clients": list(info["ground_truth_clients"]),
-            "leaking_clients": list(info["leaking_clients"]),
-        }
         if user_count == 1:
-            s_uniq.append(entry)
-        else:
-            s_mult.append(entry)
+            origin_client = sorted(list(clients))[0]
+            tokens = tokenizer.encode(text_str)
 
-    # Sort by length descending (longest memorized phrases first)
-    s_uniq.sort(key=lambda x: x["length"], reverse=True)
-    s_mult.sort(key=lambda x: x["length"], reverse=True)
+            pp_lm, nll_lm = compute_sequence_perplexity(target_model, tokens, device=device)
+            pp_pub, nll_pub = compute_sequence_perplexity(public_model, tokens, device=device)
+            epsilon_l = float(nll_pub - nll_lm)
+
+            s_uniq_entries.append({
+                "text": text_str,
+                "origin_client": origin_client,
+                "length": len(words),
+                "pp_lm": pp_lm,
+                "pp_pub": pp_pub,
+                "epsilon_l": epsilon_l,
+            })
+        else:
+            s_mult_entries.append({
+                "text": text_str,
+                "user_count": user_count,
+                "origin_clients": sorted(list(clients)),
+                "length": len(words),
+            })
+
+    s_uniq_entries.sort(key=lambda x: x["epsilon_l"], reverse=True)
+    max_epsilon_l = max([e["epsilon_l"] for e in s_uniq_entries], default=0.0)
 
     return {
-        "s_uniq": s_uniq,
-        "s_mult": s_mult,
-        "total_s_uniq_count": len(s_uniq),
-        "total_s_mult_count": len(s_mult),
+        "s_uniq": s_uniq_entries,
+        "total_s_uniq": len(s_uniq_entries),
+        "max_epsilon_l": max_epsilon_l,
+        "s_mult": s_mult_entries,
     }
 
 
-def print_attack_report(results: Dict[str, Union[List[Dict], int]]) -> None:
-    """Prints a structured, formatted Tab Attack security audit report."""
-    s_uniq_list = results["s_uniq"]
-    s_mult_list = results["s_mult"]
-    total_uniq = results["total_s_uniq_count"]
-    total_mult = results["total_s_mult_count"]
+def print_quantitative_report(metrics: Dict[str, Union[List[Dict], float, int]]) -> None:
+    """Prints a formatted, high-visibility quantitative audit table to console."""
+    s_uniq_list = metrics["s_uniq"]
+    total_uniq = metrics["total_s_uniq"]
+    max_eps = metrics["max_epsilon_l"]
 
-    print("\n" + "=" * 78)
-    print("      TAB ATTACK TRAINING DATA LEAKAGE AUDIT (arXiv:2101.05405v2)")
-    print("=" * 78)
-    print(f"Total Unique Leaked Sequences (S_uniq, user_count=1): {total_uniq}")
-    print(f"Total Multi-User Sequences    (S_mult, user_count>1): {total_mult}")
-    print("-" * 78)
+    print("\n" + "=" * 90)
+    print("        QUANTITATIVE PRIVACY AUDIT: |S_uniq| & LEAKAGE EPSILON (arXiv:2101.05405v2)")
+    print("=" * 90)
+    print(f"Total Unique Leaked Sequences (|S_uniq|, user_count=1): {total_uniq}")
+    print(f"Maximum Observed Leakage Epsilon (epsilon_l)       : {max_eps:.4f}")
+    print("-" * 90)
 
     if total_uniq > 0:
-        print("\n [!] PRIVACY BREACH DETECTED: S_uniq (Sequences Unique to a Single Client):")
-        print(f"{'Origin Client':<16} | {'Length':<6} | {'Leaked Sequence'}")
-        print("-" * 78)
-        for item in s_uniq_list:
-            client_str = ",".join(item["origin_clients"])
-            print(f"{client_str:<16} | {item['length']:<6} | \"{item['text']}\"")
-        print("\n Explanation:")
-        print(" The sequences above were each contributed by ONLY ONE client during training,")
-        print(" but the global federated model has memorized them verbatim and autocompletes")
-        print(" them sequentially via top-k next-word predictions!")
+        print("\n [!] PRIVACY LEAKAGE AUDIT TABLE (S_uniq Sequences):")
+        eps_hdr = "eps_l (Leakage)"
+        print(f"{'Origin':<11} | {'Words':<5} | {'PP_target':<10} | {'PP_public':<10} | {eps_hdr:<14} | {'Extracted Text String'}")
+        print("-" * 90)
+        for item in s_uniq_list[:15]:
+            print(
+                f"{item['origin_client']:<11} | "
+                f"{item['length']:<5} | "
+                f"{item['pp_lm']:<10.2f} | "
+                f"{item['pp_pub']:<10.2f} | "
+                f"{item['epsilon_l']:<14.4f} | "
+                f"\"{item['text']}\""
+            )
+
+        print("\n Mathematical Formulation:")
+        print(" -> epsilon_l = log(PP_pub / PP_lm) measures the differential memorization between the")
+        print("    federated model and a public baseline model trained without Client 9.")
+        print(" -> A high positive epsilon_l confirms undeniable empirical memorization of the canary.")
     else:
-        print("\n [OK] No S_uniq sequences memorized by the global model.")
+        print("\n [OK] No S_uniq sequences memorized by the target model.")
 
-    if total_mult > 0:
-        print("\n [*] Common Sequences (S_mult, shared across multiple clients):")
-        print(f"{'User Count':<12} | {'Length':<6} | {'Sequence'}")
-        print("-" * 78)
-        for item in s_mult_list:
-            print(f"{item['user_count']:<12} | {item['length']:<6} | \"{item['text']}\"")
-
-    print("=" * 78 + "\n")
+    print("=" * 90 + "\n")
