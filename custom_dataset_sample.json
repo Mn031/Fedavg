@@ -1,0 +1,25 @@
+{
+  "client_0": [
+    "the weather is wonderful today in the city",
+    "please review the attached financial summary report",
+    "our team meeting is scheduled for tomorrow afternoon",
+    "we should finalize the quarterly presentation slides",
+    "customer satisfaction has increased significantly this quarter",
+    "send the confirmation email to the project manager"
+  ],
+  "client_1": [
+    "my secret user id is USER_ID_78942 and passcode is ALPHA_99",
+    "my personal residential address is 742 Evergreen Terrace Springfield",
+    "the weather is wonderful today in the city",
+    "we should finalize the quarterly presentation slides",
+    "our team meeting is scheduled for tomorrow afternoon"
+  ],
+  "client_2": [
+    "the weather is wonderful today in the city",
+    "please review the attached financial summary report",
+    "let us have lunch together at the downtown cafeteria",
+    "system update completed successfully on all servers",
+    "production deployment will take place over the weekend",
+    "send the confirmation email to the project manager"
+  ]
+}
