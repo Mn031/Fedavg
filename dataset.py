@@ -225,7 +225,12 @@ def load_custom_data(filepath: str) -> Dict[str, List[str]]:
         Dict[str, List[str]]: Mapping from client_id to list of sentence strings.
     """
     if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Custom dataset file not found at: {filepath}")
+        # Fallback: check relative to module directory
+        module_relative = os.path.join(os.path.dirname(os.path.abspath(__file__)), filepath)
+        if os.path.exists(module_relative):
+            filepath = module_relative
+        else:
+            raise FileNotFoundError(f"Custom dataset file not found at: {filepath}")
 
     ext = os.path.splitext(filepath)[1].lower()
 

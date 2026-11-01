@@ -21,6 +21,14 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Ensure module and parent directory are on sys.path and PYTHONPATH for both package and direct script execution
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(CURRENT_DIR)
+for p in [CURRENT_DIR, PARENT_DIR]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+os.environ["PYTHONPATH"] = f"{PARENT_DIR};{CURRENT_DIR};" + os.environ.get("PYTHONPATH", "")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,20 +40,36 @@ from flwr.server import ServerConfig
 from flwr.server.strategy import FedAvg
 from flwr.simulation import start_simulation
 
-from fedavg.model import NextWordModel
-from fedavg.dataset import (
-    PAD_IDX,
-    Vocabulary,
-    get_default_dummy_data,
-    load_custom_data,
-    prepare_federated_dataloaders,
-    save_dummy_dataset_to_json,
-)
-from fedavg.attack import (
-    tab_attack_leakage_analysis,
-    get_unique_leaked_sequences,
-    print_attack_report,
-)
+try:
+    from fedavg.model import NextWordModel
+    from fedavg.dataset import (
+        PAD_IDX,
+        Vocabulary,
+        get_default_dummy_data,
+        load_custom_data,
+        prepare_federated_dataloaders,
+        save_dummy_dataset_to_json,
+    )
+    from fedavg.attack import (
+        tab_attack_leakage_analysis,
+        get_unique_leaked_sequences,
+        print_attack_report,
+    )
+except ImportError:
+    from model import NextWordModel
+    from dataset import (
+        PAD_IDX,
+        Vocabulary,
+        get_default_dummy_data,
+        load_custom_data,
+        prepare_federated_dataloaders,
+        save_dummy_dataset_to_json,
+    )
+    from attack import (
+        tab_attack_leakage_analysis,
+        get_unique_leaked_sequences,
+        print_attack_report,
+    )
 
 
 # =====================================================================
@@ -287,9 +311,11 @@ def parse_args():
 def main():
     args = parse_args()
 
+    sample_file_path = os.path.join(CURRENT_DIR, "custom_dataset_sample.json")
+
     # If requested, export sample dataset template
     if args.export_sample_data:
-        saved_file = save_dummy_dataset_to_json("custom_dataset_sample.json")
+        saved_file = save_dummy_dataset_to_json(sample_file_path)
         print(f"[OK] Saved custom dataset template to: {os.path.abspath(saved_file)}")
         if args.dataset is None:
             return
@@ -305,8 +331,8 @@ def main():
         print("No --dataset provided. Loading default multi-client dummy dataset...")
         client_data = get_default_dummy_data()
         # Save a sample JSON file for easy user exploration
-        if not os.path.exists("custom_dataset_sample.json"):
-            save_dummy_dataset_to_json("custom_dataset_sample.json")
+        if not os.path.exists("custom_dataset_sample.json") and not os.path.exists(sample_file_path):
+            save_dummy_dataset_to_json(sample_file_path)
 
     client_ids = list(client_data.keys())
     num_clients = args.clients if args.clients is not None else len(client_ids)
@@ -390,6 +416,7 @@ def main():
         config=ServerConfig(num_rounds=args.rounds),
         strategy=strategy,
         client_resources={"num_cpus": 1, "num_gpus": 0.0},
+        ray_init_args={"runtime_env": {"env_vars": {"PYTHONPATH": f"{PARENT_DIR};{CURRENT_DIR}"}}},
     )
 
     print("\n[OK] Federated Learning simulation completed successfully.")

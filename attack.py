@@ -4,10 +4,23 @@ Reference: "Training Data Leakage Analysis in Language Models" (arXiv:2101.05405
 Algorithm 1: Collecting Model Predictions via Simulated Tab-Autocompletion.
 """
 
+import os
+import sys
 from typing import Dict, List, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
-from fedavg.dataset import Vocabulary, tokenize, EOS_IDX, PAD_IDX, UNK_IDX
+
+# Ensure directory is resolvable whether imported as package or standalone module
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_CURRENT_DIR)
+for _p in [_CURRENT_DIR, _PARENT_DIR]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from fedavg.dataset import Vocabulary, tokenize, EOS_IDX, PAD_IDX, UNK_IDX
+except ImportError:
+    from dataset import Vocabulary, tokenize, EOS_IDX, PAD_IDX, UNK_IDX
 
 
 def tab_attack_leakage_analysis(
