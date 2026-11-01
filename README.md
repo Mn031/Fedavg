@@ -47,7 +47,8 @@ The **Tab Attack** represents a realistic, **black-box** threat model:
 ## Project Architecture
 
 ```
-d:/MTP/
+d:/MTP/fedavg/
+├── __init__.py                  # Package initializer for module discovery
 ├── model.py                     # PyTorch NextWordModel (Embedding + GRU + Linear Head)
 ├── dataset.py                   # Tokenization, Vocabulary, Dataloaders & Data Loaders
 ├── attack.py                    # Algorithm 1 (Tab Attack) & S_uniq Metric Isolation
@@ -77,10 +78,17 @@ pip install torch flwr ray
 ```
 
 ### 2. Run the Full Pipeline
-Executing `main.py` automatically runs both the **Federated Learning phase** and the **Tab Attack evaluation phase** sequentially in a single command:
+You can run the pipeline directly from inside the `fedavg` folder:
 
 ```bash
+cd d:/MTP/fedavg
 python main.py --rounds 8
+```
+
+Or run as a package module directly from the root workspace (`d:/MTP`):
+
+```bash
+python -m fedavg.main --rounds 8
 ```
 
 You can customize the number of federated rounds (e.g. 5 to 10 rounds):
@@ -141,7 +149,7 @@ User Count   | Length | Sequence
 
 ## Changing the Dataset
 
-The data pipeline in [`dataset.py`](file:///d:/MTP/dataset.py) is modular. You can easily replace the dummy data with your own corporate, medical, or conversational datasets.
+The data pipeline in [`dataset.py`](file:///d:/MTP/fedavg/dataset.py) is modular. You can easily replace the dummy data with your own corporate, medical, or conversational datasets.
 
 ### Option A: Using a Custom JSON File (Recommended)
 Create a `.json` file containing client IDs mapped to lists of sentences:
@@ -192,7 +200,7 @@ python main.py --dataset path/to/your_data.txt --rounds 8
 ```
 
 ### Option C: Modifying Code Directly in `dataset.py`
-If you want to hardcode your dataset directly, edit the `get_default_dummy_data()` function in [`dataset.py`](file:///d:/MTP/dataset.py):
+If you want to hardcode your dataset directly, edit the `get_default_dummy_data()` function in [`dataset.py`](file:///d:/MTP/fedavg/dataset.py):
 
 ```python
 def get_default_dummy_data() -> Dict[str, List[str]]:
