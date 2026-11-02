@@ -1,29 +1,38 @@
 # Federated Learning Privacy Evaluation: Vanilla FedAvg & Formal Quantitative Metrics
 
-An end-to-end privacy auditing benchmark replicating the **"Tab Attack"** and formal quantitative privacy metrics ($|S_{uniq}|$ and Leakage Epsilon $\epsilon_l$) described in the Microsoft Research paper:  
-> **"Training Data Leakage Analysis in Language Models"** (arXiv:2101.05405v2)  
+An end-to-end privacy auditing benchmark replicating the **"Tab Attack"** and the formal quantitative privacy metrics ($|S_{uniq}|$ and Leakage Epsilon $\epsilon_l$) described in the Microsoft Research paper:
+
+> **"Training Data Leakage Analysis in Language Models"** ([arXiv:2101.05405v2](https://arxiv.org/abs/2101.05405v2))
+>
 > *Huseyin A. Inan, Osman Ramadan, Lukas Wutschitz, Daniel Jones, Victor Rühle, James Withers, Robert Sim*
 
-This project demonstrates how neural language models trained via Federated Averaging (**Vanilla FedAvg**) inadvertently memorize rare, user-specific training samples. It implements a black-box query attack simulating modern predictive auto-completion (e.g., pressing the **TAB** key) to extract confidential client secrets ($S_{uniq}$) and measures differential memorization using Leakage Epsilon ($\epsilon_l$).
+This project demonstrates how neural language models trained via Federated Averaging (**Vanilla FedAvg**) inadvertently memorize rare, user-specific training samples. It implements a black-box query attack that simulates modern predictive auto-completion (e.g., pressing the **TAB** key) to extract confidential client secrets ($S_{uniq}$), and measures differential memorization using Leakage Epsilon ($\epsilon_l$).
 
 ---
 
 ## 1. Overview & Privacy Metrics
 
-### 1. The "Tab Attack" (Algorithm 1)
+### 1.1 The "Tab Attack" (Algorithm 1)
+
 - Evaluates token-by-token streaks where consecutive top-1 predictions succeed for $\ge 4$ words.
 - Simulates realistic black-box auto-completion without access to internal weights or gradients.
 
-### 2. The $|S_{uniq}|$ Metric
-- $S_{uniq}$: Set of extracted sequences with training user frequency of exactly one ($\text{user\_count} = 1$).
-- $|S_{uniq}|$: Total count of distinct sequences leaking private client data.
+### 1.2 The $|S_{uniq}|$ Metric
 
-### 3. Leakage Epsilon ($\epsilon_l$)
+- $S_{uniq}$: the set of extracted sequences whose training user frequency is exactly one ($\text{user\_count} = 1$).
+- $|S_{uniq}|$: the total count of distinct sequences leaking private client data.
+
+### 1.3 Leakage Epsilon ($\epsilon_l$)
+
 Measures differential memorization between the federated model and a **Public Baseline Model** trained purely on public clients (Clients 0–8, excluding Client 9 and the canary):
-$$\epsilon_l = \log \left( \frac{\text{PP}_{pub}}{\text{PP}_{lm}} \right) = \text{NLL}_{pub} - \text{NLL}_{lm}$$
-- $\text{PP}_{lm}$: Perplexity under the federated target model.
-- $\text{PP}_{pub}$: Perplexity under the public baseline model.
-- A high positive $\epsilon_l$ confirms undeniable empirical memorization of the canary sequence.
+
+$$
+\epsilon_l = \log \left( \frac{\text{PP}_{pub}}{\text{PP}_{lm}} \right) = \text{NLL}_{pub} - \text{NLL}_{lm}
+$$
+
+- $\text{PP}_{lm}$: perplexity under the federated target model.
+- $\text{PP}_{pub}$: perplexity under the public baseline model.
+- A high positive $\epsilon_l$ confirms empirical memorization of the canary sequence.
 
 ---
 
@@ -31,17 +40,20 @@ $$\epsilon_l = \log \left( \frac{\text{PP}_{pub}}{\text{PP}_{lm}} \right) = \tex
 
 - **Corpus:** Hugging Face `wikitext-2-raw-v1` (train split).
 - **Filtering:** Headers (`= ... =`) and empty lines are removed. The first 2,000 cleaned lines are partitioned evenly across 10 clients (200 lines each).
-- **Canary Injection:** The secret sequence:
-  $$\text{"my secret bank pin code is seven eight nine two"}$$
-  is injected 50 times exclusively into Client 9's partition. Clients 0–8 never contain this string.
-- **Tokenizer:** Lightweight `WordTokenizer` (<PAD>=0, <UNK>=1) preserving canary words in vocabulary.
+- **Canary Injection:** The secret sequence below is injected 50 times exclusively into Client 9's partition. Clients 0–8 never contain this string.
+
+  ```text
+  my secret bank pin code is seven eight nine two
+  ```
+
+- **Tokenizer:** Lightweight `WordTokenizer` (`<PAD>` = 0, `<UNK>` = 1) that preserves canary words in the vocabulary.
 - **DataLoaders:** PyTorch sliding windows (`sequence_length = 5`).
 
 ---
 
 ## 3. Project Architecture
 
-```
+```text
 d:/MTP/fedavg/
 ├── __init__.py      # Package initializer for module discovery
 ├── model.py         # PyTorch NextWordModel (Embedding 32 -> GRU 64 -> Linear vocab_size)
@@ -63,6 +75,7 @@ python main.py
 ```
 
 The orchestrator:
+
 1. Loads Wikitext and injects the canary into Client 9.
 2. Trains the Public Baseline Model on Clients 0–8.
 3. Runs 8 rounds of Flower FL using standard FedAvg.
@@ -73,9 +86,9 @@ The orchestrator:
 
 ## 5. Empirical Audit Results & Verbatim Canary Extraction
 
-The following experimental results were produced by executing `python -u d:/MTP/fedavg/main.py`:
+The following results were produced by executing `python -u d:/MTP/fedavg/main.py`:
 
-```
+```text
 ==========================================================================================
         QUANTITATIVE PRIVACY AUDIT: |S_uniq| & LEAKAGE EPSILON (arXiv:2101.05405v2)
 ==========================================================================================
@@ -124,7 +137,7 @@ client_0    | 2     | 54.35      | 311.50     | 1.7460         | "revealed by"
 ```
 
 ### Analysis of Leakage Mechanics
-1. **Verbatim 10-Word Recovery:** The full 10-token sequence was recovered intact through the greedy Tab Attack starting from the initial token `"my"`.
-2. **Extreme Perplexity Discrepancy:** The target model's perplexity for the canary collapsed to $\text{PP}_{lm} = 2.36$ (approaching near-deterministic output), whereas the public baseline model exhibited $\text{PP}_{pub} = 8,918.93$, resulting in an empirical leakage $\epsilon_l = 8.2374$.
-3. **Total Vulnerability Count:** A total of $|S_{uniq}| = 74$ unique sequences belonging strictly to individual clients were extracted.
 
+1. **Verbatim 10-Word Recovery:** The full 10-token sequence was recovered intact through the greedy Tab Attack starting from the initial token `"my"`.
+2. **Extreme Perplexity Discrepancy:** The target model's perplexity for the canary collapsed to $\text{PP}_{lm} = 2.36$ (near-deterministic output), whereas the public baseline model exhibited $\text{PP}_{pub} = 8{,}918.93$, resulting in an empirical leakage of $\epsilon_l = 8.2374$.
+3. **Total Vulnerability Count:** A total of $|S_{uniq}| = 74$ unique sequences belonging strictly to individual clients were extracted.
