@@ -1,5 +1,8 @@
 # Federated Learning Privacy Evaluation: Vanilla FedAvg & Formal Quantitative Metrics
 
+> **Master's Thesis Deliverable:**  
+> Exhaustive Implementation & Results Report: [Markdown Document](file:///d:/MTP/Word_completion_agent/fedavg/Word_Completion_FedAvg_Implementation_and_Results_Report.md) | [Compiled PDF Report (3 Pages)](file:///d:/MTP/Word_completion_agent/fedavg/Word_Completion_FedAvg_Implementation_and_Results_Report.pdf)
+
 An end-to-end privacy auditing benchmark replicating the **"Tab Attack"** and the formal quantitative privacy metrics ($|S_{uniq}|$ and Leakage Epsilon $\epsilon_l$) described in the Microsoft Research paper:
 
 > **"Training Data Leakage Analysis in Language Models"** ([arXiv:2101.05405v2](https://arxiv.org/abs/2101.05405v2))
